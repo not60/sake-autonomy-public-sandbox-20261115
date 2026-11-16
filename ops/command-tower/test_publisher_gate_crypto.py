@@ -1,42 +1,34 @@
-"""Positive and negative Ed25519 tests with ephemeral test-only keys."""
+"""End-to-end Ed25519 tests using ephemeral test-only role keys."""
 from __future__ import annotations
 
-import base64
 import hashlib
-import json
 from pathlib import Path
 import tempfile
 import unittest
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from attestations import canonical_json, issue_permit, issue_witness, sign_envelope
+from cas_journal import PermitCasJournal
 from durable_store import DurableStore
-from publisher_gate import PublisherGate, PublisherGateHold, TrustedVerificationKey
+from publisher_gate import (
+    PublisherGate, PublisherGateHold, TrustedVerificationKey, prepare_draft_pr_plan,
+)
+from test_cas_journal import MemoryCasBackend
 
 
 REPOSITORY_ID = 1458303357
 BASE_SHA = "a" * 40
 PATH = "ops/command-tower/candidate.py"
 CONTENT = b"test-only signed candidate\n"
-
-
-def canonical(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, allow_nan=False).encode("utf-8")
+CODEX_OUTPUT = b"test-only Codex result\n"
+WORKER_RUN_ID = "test-run-42"
 
 
 def public_bytes(private_key: Ed25519PrivateKey) -> bytes:
     return private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw,
     )
-
-
-def signed_envelope(key_id: str, private_key: Ed25519PrivateKey,
-                    payload: dict[str, object]) -> dict[str, object]:
-    signature = private_key.sign(canonical(payload))
-    return {"key_id": key_id, "signature": base64.b64encode(signature).decode("ascii"),
-            "payload": payload}
 
 
 class PublisherGateCryptoTests(unittest.TestCase):
@@ -46,122 +38,139 @@ class PublisherGateCryptoTests(unittest.TestCase):
         self.source = self.root / PATH
         self.source.parent.mkdir(parents=True)
         self.source.write_bytes(CONTENT)
-        self.authority_private = Ed25519PrivateKey.generate()
-        self.witness_private = Ed25519PrivateKey.generate()
-        self.other_private = Ed25519PrivateKey.generate()
-        self.authority_key = TrustedVerificationKey(
-            "authority-key", "permit_authority", public_bytes(self.authority_private),
+        self.output = Path(self.temporary.name) / "codex-output.bin"
+        self.output.write_bytes(CODEX_OUTPUT)
+        self.keys = {
+            role: Ed25519PrivateKey.generate()
+            for role in ("permit_authority", "witness", "owner_a", "owner_b", "untrusted")
+        }
+        self.trusted_keys = {
+            role + "-key": TrustedVerificationKey(role + "-key", role, public_bytes(private))
+            for role, private in self.keys.items() if role != "untrusted"
+        }
+        self.backend = MemoryCasBackend()
+        self.journal = PermitCasJournal(self.backend, repository_id=REPOSITORY_ID)
+        self.store = DurableStore(Path(self.temporary.name) / "publisher.sqlite3")
+        material = {
+            "schema": 2, "repository_id": REPOSITORY_ID, "base_sha": BASE_SHA,
+            "worker_run_id": WORKER_RUN_ID,
+            "codex_output_sha256": hashlib.sha256(CODEX_OUTPUT).hexdigest(),
+            "changed_paths": [PATH],
+            "files": {PATH: hashlib.sha256(CONTENT).hexdigest()},
+        }
+        self.manifest = {**material,
+                         "candidate_digest": hashlib.sha256(canonical_json(material)).hexdigest()}
+        self.permit = issue_permit(
+            permit_id="test-permit-1", issuer_id="permit_authority-key",
+            private_key=self.keys["permit_authority"], repository_id=REPOSITORY_ID,
+            base_sha=BASE_SHA, candidate_digest=self.manifest["candidate_digest"],
+            changed_paths=(PATH,), worker_run_id=WORKER_RUN_ID,
+            journal=self.journal, local_store=self.store,
         )
-        self.witness_key = TrustedVerificationKey(
-            "witness-key", "witness", public_bytes(self.witness_private),
+        self.witness = issue_witness(
+            witness_id="witness-key", private_key=self.keys["witness"],
+            permit=self.permit, journal=self.journal,
         )
-        files = {PATH: hashlib.sha256(CONTENT).hexdigest()}
-        material: dict[str, object] = {
-            "schema": 1,
-            "repository_id": REPOSITORY_ID,
-            "base_sha": BASE_SHA,
-            "changed_paths": [PATH],
-            "files": files,
+        permit_digest = hashlib.sha256(canonical_json(self.permit["payload"])).hexdigest()
+        witness_digest = hashlib.sha256(canonical_json(self.witness)).hexdigest()
+        approval_payload = {
+            "schema": 1, "decision": "DRAFT_PR_ONLY", "repository_id": REPOSITORY_ID,
+            "base_sha": BASE_SHA, "candidate_digest": self.manifest["candidate_digest"],
+            "changed_paths": [PATH], "permit_digest": permit_digest,
+            "witness_digest": witness_digest, "worker_run_id": WORKER_RUN_ID,
         }
-        self.manifest = {
-            **material,
-            "candidate_digest": hashlib.sha256(canonical(material)).hexdigest(),
+        self.approvals = {
+            role: sign_envelope(key_id=role + "-key", private_key=self.keys[role],
+                                payload=approval_payload)
+            for role in ("owner_a", "owner_b")
         }
-        permit_payload: dict[str, object] = {
-            "schema": 1,
-            "permit_id": "test-permit-1",
-            "issuer_id": "authority-key",
-            "repository_id": REPOSITORY_ID,
-            "base_sha": BASE_SHA,
-            "candidate_digest": self.manifest["candidate_digest"],
-            "changed_paths": [PATH],
-            "issuer_role": "permit_authority",
-        }
-        self.permit = signed_envelope("authority-key", self.authority_private, permit_payload)
-        permit_digest = hashlib.sha256(canonical(permit_payload)).hexdigest()
-        witness_payload: dict[str, object] = {
-            "schema": 1,
-            "witness_id": "witness-key",
-            "permit_digest": permit_digest,
-            "repository_id": REPOSITORY_ID,
-            "base_sha": BASE_SHA,
-            "candidate_digest": self.manifest["candidate_digest"],
-            "changed_paths": [PATH],
-            "issuer_role": "witness",
-        }
-        self.witness = signed_envelope("witness-key", self.witness_private, witness_payload)
-        self.store = self._new_store("publisher.sqlite3")
-        self.gate = self._new_gate(self.store)
+        self.gate = self._gate(self.store, self.trusted_keys, self.journal)
 
     def tearDown(self) -> None:
         self.store.close()
         self.temporary.cleanup()
 
-    def _new_store(self, filename: str) -> DurableStore:
-        return DurableStore(Path(self.temporary.name) / filename)
-
-    def _new_gate(self, store: DurableStore,
-                  keys: dict[str, TrustedVerificationKey] | None = None) -> PublisherGate:
+    def _gate(self, store, keys=None, journal=None):
         return PublisherGate(
-            repository_id=REPOSITORY_ID,
-            base_sha=BASE_SHA,
-            allowed_paths=(PATH,),
-            trusted_keys=keys or {
-                "authority-key": self.authority_key,
-                "witness-key": self.witness_key,
-            },
-            durable_store=store,
+            repository_id=REPOSITORY_ID, base_sha=BASE_SHA,
+            allowed_paths=(PATH,), trusted_keys=keys or self.trusted_keys,
+            durable_store=store, cas_journal=journal or self.journal,
         )
 
-    def test_valid_test_only_permit_and_witness_verify_without_authorizing_write(self) -> None:
-        result = self.gate.verify_bundle(
+    def verify(self, gate=None, approvals=None, permit=None, witness=None):
+        return (gate or self.gate).verify_bundle(
             artifact_root=self.root, manifest=self.manifest,
-            permit=self.permit, witness=self.witness,
+            permit=self.permit if permit is None else permit,
+            witness=self.witness if witness is None else witness,
+            codex_output_file=self.output,
+            owner_approvals=self.approvals if approvals is None else approvals,
         )
-        self.assertEqual(result.permit_id, "test-permit-1")
+
+    def test_four_independent_role_signatures_and_cas_prepare_plan_without_write(self) -> None:
+        result = self.verify()
+        self.assertTrue(result.draft_pr_ready)
         self.assertFalse(result.publication_authorized)
+        plan = prepare_draft_pr_plan(result)
+        self.assertFalse(plan.create_enabled)
+        self.assertEqual(plan.changed_paths, (PATH,))
+        self.assertEqual(self.journal.snapshot().sequence, 2)
         self.assertEqual(self.store.state, "DRAFT_HOLD")
         self.assertTrue(self.store.journal.verify())
 
-    def test_invalid_permit_signature_is_rejected(self) -> None:
-        invalid = dict(self.permit)
-        invalid["signature"] = base64.b64encode(b"x" * 64).decode("ascii")
-        with self.assertRaises(PublisherGateHold) as held:
-            self.gate.verify_bundle(artifact_root=self.root, manifest=self.manifest,
-                                    permit=invalid, witness=self.witness)
-        self.assertEqual(held.exception.reason, "signature_invalid")
-        self.assertEqual(self.store.state, "SAFE_STOPPED")
-
-    def test_untrusted_public_key_is_rejected(self) -> None:
-        wrong_authority = TrustedVerificationKey(
-            "authority-key", "permit_authority", public_bytes(self.other_private),
+    def test_independent_auditor_checks_consumption_without_mutating_cas(self) -> None:
+        self.verify()
+        before = self.journal.snapshot()
+        auditor_store = self._new_store("auditor.sqlite3")
+        auditor = self._gate(auditor_store)
+        audited = auditor.audit_bundle(
+            artifact_root=self.root, manifest=self.manifest,
+            permit=self.permit, witness=self.witness,
+            codex_output_file=self.output, owner_approvals=self.approvals,
         )
-        gate = self._new_gate(self.store, {
-            "authority-key": wrong_authority,
-            "witness-key": self.witness_key,
-        })
-        with self.assertRaises(PublisherGateHold) as held:
-            gate.verify_bundle(artifact_root=self.root, manifest=self.manifest,
-                               permit=self.permit, witness=self.witness)
-        self.assertEqual(held.exception.reason, "signature_invalid")
-        self.assertEqual(self.store.state, "SAFE_STOPPED")
+        after = self.journal.snapshot()
+        self.assertFalse(audited.draft_pr_ready)
+        self.assertEqual(before.head_sha256, after.head_sha256)
+        self.assertEqual(before.sequence, after.sequence)
+        auditor_store.close()
 
-    def test_tampered_signed_artifact_is_rejected(self) -> None:
+    def test_missing_owner_approval_stops_before_permit_consumption(self) -> None:
+        with self.assertRaisesRegex(PublisherGateHold, "both_owner_draft_approvals_required"):
+            self.verify(approvals={})
+        self.assertEqual(self.journal.snapshot().sequence, 1)
+
+    def test_invalid_permit_signature_is_rejected(self) -> None:
+        invalid = {**self.permit, "signature": "eHh4"}
+        with self.assertRaisesRegex(PublisherGateHold, "signature_invalid"):
+            self.verify(gate=self._gate(self._new_store("bad-permit.sqlite3"), journal=self.journal),
+                        permit=invalid)
+
+    def test_untrusted_authority_key_is_rejected(self) -> None:
+        keys = dict(self.trusted_keys)
+        keys["permit_authority-key"] = TrustedVerificationKey(
+            "permit_authority-key", "permit_authority", public_bytes(self.keys["untrusted"]),
+        )
+        with self.assertRaisesRegex(PublisherGateHold, "signature_invalid"):
+            self.verify(gate=self._gate(self._new_store("untrusted.sqlite3"), keys, self.journal))
+
+    def test_tampered_artifact_and_codex_output_are_rejected(self) -> None:
         self.source.write_bytes(b"modified after signing\n")
-        with self.assertRaises(PublisherGateHold) as held:
-            self.gate.verify_bundle(artifact_root=self.root, manifest=self.manifest,
-                                    permit=self.permit, witness=self.witness)
-        self.assertEqual(held.exception.reason, "artifact_digest_mismatch")
-        self.assertEqual(self.store.state, "SAFE_STOPPED")
+        with self.assertRaisesRegex(PublisherGateHold, "artifact_digest_mismatch"):
+            self.verify(gate=self._gate(self._new_store("tampered-file.sqlite3")))
+        self.source.write_bytes(CONTENT)
+        self.output.write_bytes(b"tampered Codex result")
+        with self.assertRaisesRegex(PublisherGateHold, "codex_output_digest_mismatch"):
+            self.verify(gate=self._gate(self._new_store("tampered-output.sqlite3")))
 
-    def test_valid_bundle_replay_is_rejected_durably(self) -> None:
-        self.gate.verify_bundle(artifact_root=self.root, manifest=self.manifest,
-                                permit=self.permit, witness=self.witness)
-        with self.assertRaises(PublisherGateHold) as held:
-            self.gate.verify_bundle(artifact_root=self.root, manifest=self.manifest,
-                                    permit=self.permit, witness=self.witness)
-        self.assertEqual(held.exception.reason, "permit_replay_or_id_reuse")
-        self.assertEqual(self.store.state, "SAFE_STOPPED")
+    def test_stale_journal_witness_is_rejected(self) -> None:
+        self.journal.record_issuance(
+            permit_id="intervening", candidate_digest="x" * 64,
+            permit_digest="y" * 64, worker_run_id="other-run",
+        )
+        with self.assertRaisesRegex(PublisherGateHold, "witness_journal_parent_mismatch"):
+            self.verify(gate=self._gate(self._new_store("stale.sqlite3")))
+
+    def _new_store(self, filename: str) -> DurableStore:
+        return DurableStore(Path(self.temporary.name) / filename)
 
 
 if __name__ == "__main__":

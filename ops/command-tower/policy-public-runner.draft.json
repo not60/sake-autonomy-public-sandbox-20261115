@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "candidate_id": "b09-public-runner-policy-v1",
+  "candidate_id": "b09-public-runner-policy-v2",
   "state": "DRAFT_HOLD",
   "signed": false,
   "signature": null,
@@ -42,34 +42,76 @@
       },
       "codex_action": {
         "repository": "openai/codex-action",
-        "immutable_commit_pin": "REQUIRED_BEFORE_SIGNATURE",
+        "immutable_commit_pin": "bdf19a4a223ec2549a3e2274a0cf61556bc07675",
         "api_key_secret_name": "OPENAI_API_KEY",
         "secret_state": "EXISTENCE_UNVERIFIED_NOT_CREATED_OR_READ",
         "exposure_scope": "worker_job_only",
-        "sandbox_candidate": "workspace-write"
+        "sandbox_candidate": "workspace-write",
+        "write_access_check": "DEFAULT_ACTION_CHECK_REQUIRES_OWNER_ACTOR_WRITE_ACCESS",
+        "output": "final_message_file_bound_into_worker_manifest",
+        "release": "v1.13",
+        "write_access_guard": "use_action_default_actor_write_access_check_no_bypass"
       },
-      "outputs": ["candidate.patch", "manifest.json", "sha256sums.txt"]
+      "outputs": [
+        "candidate.patch",
+        "manifest.json",
+        "sha256sums.txt"
+      ],
+      "credential_separation": {
+        "codex_api_credential": "OPENAI_API_KEY_WORKER_JOB_ONLY_NOT_CONFIRMED",
+        "github_token": "CONTENTS_READ_ONLY",
+        "publisher_or_auditor_credentials": "NONE"
+      }
     },
     {
       "role": "publisher",
       "job_id": "publisher",
       "responsibility": "Re-hash and validate worker artifact; create draft PR only after signed gates",
       "github_permissions": {
-        "contents": "write",
+        "contents": "read",
         "pull_requests": "write",
         "actions": "none"
       },
       "credential_candidate": {
-        "type": "repository_scoped_github_app_installation_token_or_fine_grained_pat",
+        "type": "external_https_cas_write_token_and_later_repo_limited_github_pr_credential",
         "repository_scope": "not60/sake-autonomy-public-sandbox-20261115_only",
-        "permissions": ["contents:write", "pull_requests:write"],
-        "status": "NOT_ISSUED_NOT_CONFIGURED"
+        "status": "NOT_CONFIGURED_NOT_CREATED",
+        "cas_access": "conditional_put_for_permit_journal",
+        "github_access": "dedicated_repo_limited_app_or_fine_grained_pat_candidate",
+        "required_permissions": {
+          "contents": "write",
+          "pull_requests": "write",
+          "actions": "none"
+        },
+        "default_github_token_permissions": {
+          "contents": "read",
+          "pull_requests": "write",
+          "actions": "none"
+        },
+        "default_github_token_expanded": false,
+        "required_scope": "not60/sake-autonomy-public-sandbox-20261115_only",
+        "commit_api_candidate": "GraphQL_createCommitOnBranch_expectedHeadOid",
+        "commit_retry_policy": "NEVER_RETRY_ON_CONFLICT_API_ERROR_OR_UNKNOWN_RESULT",
+        "force_update": false
       },
       "pull_request_ci": {
         "preferred_auth": "github_app_or_repository_scoped_pat",
         "reason": "GITHUB_TOKEN-created pull_request workflow runs require approval",
         "workflow": ".github/workflows/sandbox-pr-readonly.yml",
         "dispatch_or_status_reporter_job": "NOT_PROPOSED"
+      },
+      "draft_pr_gate": {
+        "requires": [
+          "actual_worker_delta",
+          "codex_output_base_manifest_digest_match",
+          "permit_authority_signature",
+          "independent_witness_signature",
+          "owner_a_and_owner_b_draft_pr_signatures",
+          "external_cas_consumption",
+          "local_sqlite_permit_consumption"
+        ],
+        "github_write_implemented": false,
+        "plan_only": true
       }
     },
     {
@@ -81,36 +123,50 @@
         "pull_requests": "read",
         "actions": "read"
       },
-      "secrets": [],
-      "write_permissions": []
+      "secrets": [
+        "B09_CAS_READ_TOKEN"
+      ],
+      "write_permissions": [],
+      "credential_candidate": {
+        "type": "distinct_external_cas_read_only_token",
+        "status": "NOT_CONFIGURED_NOT_CREATED",
+        "github_access": "contents:read,pull-requests:read,actions:read",
+        "worker_or_publisher_credentials": "NONE"
+      }
     }
   ],
   "artifact_gate": {
     "fail_closed": true,
+    "manifest_schema": 2,
     "required_manifest_fields": [
       "schema",
       "repository_id",
       "base_sha",
       "worker_run_id",
-      "candidate_sha256",
+      "codex_output_sha256",
+      "candidate_digest",
       "changed_paths",
-      "permit_digest",
-      "witness_digest",
-      "policy_sha256",
-      "runtime_sha256",
-      "backlog_sha256"
+      "files"
     ],
+    "changed_paths_source": "actual_git_delta_against_exact_base_sha",
     "publisher_rechecks_downloaded_bytes": true,
-    "auditor_recomputes_hashes_independently": true,
-    "permit_and_witness_signature_scheme": "UNRESOLVED_NO_CRYPTOGRAPHIC_SIGNER_CONFIGURED",
-    "sqlite_cross_job_and_cross_run_durability": "UNRESOLVED_LOCAL_SQLITE_IS_NOT_SHARED_BETWEEN_RUNNER_VMS"
+    "auditor_recomputes_hashes_and_cas_consumption_read_only": true,
+    "permit_witness_signature_scheme": "Ed25519_DISTINCT_ROLE_KEYS",
+    "owner_approvals": "owner_a_and_owner_b_signed_DRAFT_PR_ONLY_scope",
+    "external_cas": "HTTP_ETag_IF_MATCH_IF_NONE_MATCH",
+    "external_cas_credentials": "HOLD_NOT_CONFIGURED"
   },
   "go_gates": [
-    "exact_signed_policy_runtime_backlog_hashes_and_signatures",
-    "owner_a_and_owner_b_approval_of_runner_vm_boundary",
-    "worker_only_codex_credential_availability_without_new_secret_creation",
-    "publisher_only_repository_credential_and_repository_actions_pr_creation_setting",
-    "cryptographic_permit_witness_and_durable_journal_transport",
-    "local_contract_tests_then_separately_approved_draft_pr_and_ci"
+    "owner_a_and_owner_b_sign_exact_policy_runtime_backlog_and_workflow_sha256s",
+    "approve_actual_delta_and_codex_output_manifest_contract",
+    "provision_independent_permit_authority_witness_owner_a_owner_b_verification_keys",
+    "select_external_https_cas_and_issue_distinct_publisher_write_and_auditor_read_credentials",
+    "confirm_worker_only_codex_credential_and_action_default_write_access_check",
+    "approve_repo_limited_publisher_github_credential_and_pr_ci_authentication",
+    "approve_separately_authorized_draft_pr_cycle_then_sequential_worker_cycle_2",
+    "approve_exact_publisher_branch_commit_adapter_sha256_and_expected_head_nonforce_contract",
+    "provision_new_public_repo_limited_GitHub_App_or_fine_grained_PAT_with_contents_write_and_pull_requests_write_actions_none",
+    "keep_standard_publisher_GITHUB_TOKEN_contents_read_only",
+    "publisher_commit_uses_GraphQL_createCommitOnBranch_expectedHeadOid_and_never_retries"
   ]
 }

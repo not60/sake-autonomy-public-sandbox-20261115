@@ -57,28 +57,42 @@ class PublicRunnerDraftContractTests(unittest.TestCase):
             "contents": "read", "pull_requests": "none", "actions": "none"
         })
         self.assertEqual(roles["publisher"]["github_permissions"], {
+            "contents": "read", "pull_requests": "write", "actions": "none"
+        })
+        publisher_credential = roles["publisher"]["credential_candidate"]
+        self.assertEqual(publisher_credential["required_permissions"], {
             "contents": "write", "pull_requests": "write", "actions": "none"
         })
+        self.assertEqual(publisher_credential["default_github_token_permissions"], {
+            "contents": "read", "pull_requests": "write", "actions": "none"
+        })
+        self.assertIs(publisher_credential["default_github_token_expanded"], False)
+        self.assertEqual(publisher_credential["status"], "NOT_CONFIGURED_NOT_CREATED")
         self.assertEqual(roles["auditor"]["github_permissions"], {
             "contents": "read", "pull_requests": "read", "actions": "read"
         })
-        self.assertEqual(roles["auditor"]["secrets"], [])
+        self.assertEqual(roles["auditor"]["secrets"], ["B09_CAS_READ_TOKEN"])
         self.assertEqual(roles["auditor"]["write_permissions"], [])
-        self.assertEqual(roles["publisher"]["credential_candidate"]["status"], "NOT_ISSUED_NOT_CONFIGURED")
+        self.assertEqual(roles["publisher"]["credential_candidate"]["status"], "NOT_CONFIGURED_NOT_CREATED")
+        self.assertEqual(roles["auditor"]["credential_candidate"]["worker_or_publisher_credentials"], "NONE")
+        self.assertNotIn("allow_users", roles["worker"]["codex_action"])
+        self.assertIn("no_bypass", roles["worker"]["codex_action"]["write_access_guard"])
 
     def test_artifact_gate_binds_digests_and_remains_held_without_signer(self) -> None:
         policy = load_candidates()["policy"]
         gate = policy["artifact_gate"]
         required = set(gate["required_manifest_fields"])
-        self.assertTrue({"repository_id", "base_sha", "candidate_sha256", "changed_paths",
-                         "permit_digest", "witness_digest", "policy_sha256", "runtime_sha256",
-                         "backlog_sha256"}.issubset(required))
+        self.assertTrue({"repository_id", "base_sha", "worker_run_id", "codex_output_sha256",
+                         "candidate_digest", "changed_paths"}.issubset(required))
         self.assertTrue(gate["fail_closed"])
-        self.assertEqual(gate["permit_and_witness_signature_scheme"],
-                         "UNRESOLVED_NO_CRYPTOGRAPHIC_SIGNER_CONFIGURED")
+        self.assertEqual(gate["manifest_schema"], 2)
+        self.assertEqual(gate["changed_paths_source"], "actual_git_delta_against_exact_base_sha")
+        self.assertEqual(gate["permit_witness_signature_scheme"], "Ed25519_DISTINCT_ROLE_KEYS")
         runtime = load_candidates()["runtime"]
-        self.assertEqual(runtime["witness"]["signature_verification"],
-                         "HOLD_NO_SIGNING_OR_VERIFICATION_KEY_CONFIGURED")
+        self.assertEqual(runtime["witness"]["journal_parent_binding"],
+                         "CAS_head_sha256_after_permit_issuance")
+        self.assertFalse(runtime["local_followup"]["external_cas"]["endpoint_configured"])
+        self.assertEqual(runtime["local_followup"]["external_cas"]["legacy_supabase_write"], False)
         self.assertEqual(runtime["journal"]["cross_run_retention_and_replay_protection"],
                          "HOLD_UNRESOLVED")
 

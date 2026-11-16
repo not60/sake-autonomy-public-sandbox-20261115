@@ -28,14 +28,26 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         for job in (worker, publisher, auditor):
             self.assertRegex(job, r"(?m)^    if: \$\{\{ false(?: &&[^\n]*)? \}\}$")
         self.assertIn("contents: read", worker)
-        self.assertIn("contents: write", publisher)
+        self.assertIn("contents: read", publisher)
         self.assertIn("pull-requests: write", publisher)
         self.assertIn("contents: read", auditor)
         self.assertIn("pull-requests: read", auditor)
         self.assertIn("actions: read", auditor)
-        self.assertNotIn("secrets.", auditor)
+        self.assertIn("B09_CAS_READ_TOKEN: ${{ secrets.B09_CAS_READ_TOKEN }}", auditor)
+        self.assertNotIn("B09_CAS_TOKEN: ${{ secrets.B09_CAS_TOKEN }}", auditor)
+        self.assertNotIn("OPENAI_API_KEY", publisher + auditor)
         codex_step = source.split("      - name: Codex candidate generation\n", 1)[1].split("      - name:", 1)[0]
         self.assertIn("if: ${{ false }}", codex_step)
+        self.assertNotIn("allow-users:", codex_step)
+        self.assertIn("output-file: ${{ runner.temp }}/codex-final-message.txt", codex_step)
+
+    def test_worker_packages_actual_delta_and_binds_codex_output(self) -> None:
+        source = DRAFT_WORKFLOW.read_text(encoding="utf-8")
+        package = source.split("      - name: Package exact candidate bytes and hash manifest\n", 1)[1]
+        self.assertNotIn("--changed-path", package)
+        self.assertIn("--worker-run-id", package)
+        self.assertIn("--codex-output-file", package)
+        self.assertIn("--allowed-path", package)
 
     def test_all_actions_are_pinned_and_no_publication_command_exists(self) -> None:
         source = DRAFT_WORKFLOW.read_text(encoding="utf-8")

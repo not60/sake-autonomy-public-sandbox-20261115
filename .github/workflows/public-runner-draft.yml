@@ -38,9 +38,9 @@ jobs:
         uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          allow-users: not60
           working-directory: .
           sandbox: workspace-write
+          output-file: ${{ runner.temp }}/codex-final-message.txt
           prompt: |
             This workflow remains DRAFT_HOLD. Read the local public runner
             backlog. If it is unsigned or not SIGNED_GO, stop without editing
@@ -60,21 +60,24 @@ jobs:
             ops/command-tower/test_process_crash_recovery.py
             ops/command-tower/publisher_gate.py
             ops/command-tower/runner_artifact.py
+            ops/command-tower/cas_journal.py
+            ops/command-tower/attestations.py
             ops/command-tower/requirements-publisher.txt
+            ops/command-tower/test_cas_journal.py
             ops/command-tower/test_durable_permit_identity.py
             ops/command-tower/test_publisher_gate.py
             ops/command-tower/test_publisher_gate_crypto.py
             ops/command-tower/test_runner_artifact.py
           )
           args=()
-          for path in "${allowed_paths[@]}"; do
-            args+=(--changed-path "$path" --allowed-path "$path")
-          done
+          for path in "${allowed_paths[@]}"; do args+=(--allowed-path "$path"); done
           python ops/command-tower/runner_artifact.py \
             --worktree-root "$GITHUB_WORKSPACE" \
             --output-root "$RUNNER_TEMP/b09-bundle" \
             --repository-id 1458303357 \
             --base-sha "$GITHUB_SHA" \
+            --worker-run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --codex-output-file "$RUNNER_TEMP/codex-final-message.txt" \
             "${args[@]}"
       - name: Transfer the untrusted candidate bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -90,7 +93,7 @@ jobs:
     if: ${{ false && needs.worker.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
       actions: none
     steps:
@@ -111,6 +114,9 @@ jobs:
           name: b09-public-runner-candidate
           path: ${{ runner.temp }}/b09-bundle
       - name: Verify exact bytes, Permit, Witness, and durable single use
+        env:
+          B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
+          B09_CAS_TOKEN: ${{ secrets.B09_CAS_TOKEN }}
         run: |
           set -euo pipefail
           printf '{"keys":[]}\n' > "$RUNNER_TEMP/b09-empty-trusted-keys.json"
@@ -126,7 +132,10 @@ jobs:
             ops/command-tower/test_process_crash_recovery.py
             ops/command-tower/publisher_gate.py
             ops/command-tower/runner_artifact.py
+            ops/command-tower/cas_journal.py
+            ops/command-tower/attestations.py
             ops/command-tower/requirements-publisher.txt
+            ops/command-tower/test_cas_journal.py
             ops/command-tower/test_durable_permit_identity.py
             ops/command-tower/test_publisher_gate.py
             ops/command-tower/test_publisher_gate_crypto.py
@@ -139,10 +148,14 @@ jobs:
             --manifest "$RUNNER_TEMP/b09-bundle/manifest.json" \
             --permit "$RUNNER_TEMP/b09-bundle/permit.json" \
             --witness "$RUNNER_TEMP/b09-bundle/witness.json" \
+            --codex-output "$RUNNER_TEMP/b09-bundle/evidence/codex-output.bin" \
+            --owner-approvals "$RUNNER_TEMP/b09-bundle/owner-approvals.json" \
             --trusted-keys "$RUNNER_TEMP/b09-empty-trusted-keys.json" \
             --database "$RUNNER_TEMP/publisher-journal.sqlite3" \
             --repository-id 1458303357 \
             --base-sha "$GITHUB_SHA" \
+            --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
+            --role publisher \
             "${args[@]}"
 
   auditor:
@@ -172,6 +185,9 @@ jobs:
           name: b09-public-runner-candidate
           path: ${{ runner.temp }}/b09-bundle
       - name: Independently verify hashes and signed attestations
+        env:
+          B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
+          B09_CAS_READ_TOKEN: ${{ secrets.B09_CAS_READ_TOKEN }}
         run: |
           set -euo pipefail
           printf '{"keys":[]}\n' > "$RUNNER_TEMP/b09-empty-trusted-keys.json"
@@ -187,7 +203,10 @@ jobs:
             ops/command-tower/test_process_crash_recovery.py
             ops/command-tower/publisher_gate.py
             ops/command-tower/runner_artifact.py
+            ops/command-tower/cas_journal.py
+            ops/command-tower/attestations.py
             ops/command-tower/requirements-publisher.txt
+            ops/command-tower/test_cas_journal.py
             ops/command-tower/test_durable_permit_identity.py
             ops/command-tower/test_publisher_gate.py
             ops/command-tower/test_publisher_gate_crypto.py
@@ -200,8 +219,12 @@ jobs:
             --manifest "$RUNNER_TEMP/b09-bundle/manifest.json" \
             --permit "$RUNNER_TEMP/b09-bundle/permit.json" \
             --witness "$RUNNER_TEMP/b09-bundle/witness.json" \
+            --codex-output "$RUNNER_TEMP/b09-bundle/evidence/codex-output.bin" \
+            --owner-approvals "$RUNNER_TEMP/b09-bundle/owner-approvals.json" \
             --trusted-keys "$RUNNER_TEMP/b09-empty-trusted-keys.json" \
             --database "$RUNNER_TEMP/auditor-journal.sqlite3" \
             --repository-id 1458303357 \
             --base-sha "$GITHUB_SHA" \
+            --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
+            --role auditor \
             "${args[@]}"

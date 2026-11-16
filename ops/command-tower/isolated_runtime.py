@@ -197,7 +197,19 @@ class IsolatedRuntime:
             raise BoundaryError("permit id must be unique and nonempty")
         permit = Permit(permit_id, candidate.digest(), candidate.repository,
                         candidate.branch, candidate.paths, actor.principal_id)
-        self._append_event("PERMIT_ISSUED", permit_digest=permit.digest(), issuer_id=actor.principal_id)
+        if self._durable_store is not None:
+            try:
+                self._durable_store.record_permit_issuance(
+                    permit.permit_id, permit.candidate_digest, permit.digest(), actor.principal_id,
+                )
+            except self._durable_store.PermitIdAlreadyIssued:
+                self.safe_stop("permit_id_reuse")
+                raise SafeStop("permit_id_reuse") from None
+            except Exception:
+                self.safe_stop("durability_failure")
+                raise SafeStop("durability_failure") from None
+        else:
+            self._append_event("PERMIT_ISSUED", permit_digest=permit.digest(), issuer_id=actor.principal_id)
         self._issued_permit_ids.add(permit_id)
         return permit
 
@@ -237,12 +249,19 @@ class IsolatedRuntime:
         if self._durable_store is not None:
             try:
                 self._durable_store.consume_permit_and_record(
-                    permit_digest, plan_digest=plan_digest,
+                    permit_digest, permit_id=permit.permit_id,
+                    candidate_digest=permit.candidate_digest, plan_digest=plan_digest,
                     publisher_id=actor.principal_id, state=plan.state,
                 )
             except self._durable_store.PermitAlreadyConsumed:
                 self.safe_stop("permit_replay")
                 raise SafeStop("permit_replay") from None
+            except self._durable_store.PermitIdAlreadyConsumed:
+                self.safe_stop("permit_replay")
+                raise SafeStop("permit_replay") from None
+            except self._durable_store.PermitIdAlreadyIssued:
+                self.safe_stop("permit_id_reuse")
+                raise SafeStop("permit_id_reuse") from None
             except Exception:
                 self.safe_stop("durability_failure")
                 raise SafeStop("durability_failure") from None
@@ -306,7 +325,8 @@ class IsolatedRuntime:
             raise BoundaryError("candidate paths exceed the approved local allowlist")
 
     def _validate_permit(self, permit: Permit) -> None:
-        if permit.repository != SANDBOX_REPOSITORY or permit.issuer_id != self.permit_authority.principal_id:
+        if (not permit.permit_id or permit.repository != SANDBOX_REPOSITORY
+                or permit.issuer_id != self.permit_authority.principal_id):
             raise BoundaryError("permit issuer or repository is outside the sandbox scope")
         if not permit.paths or any(path not in self.allowed_paths for path in permit.paths):
             raise BoundaryError("permit paths exceed the approved local allowlist")

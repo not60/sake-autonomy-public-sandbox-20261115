@@ -23,6 +23,93 @@
       "sha256": "611a37b4d990d9a9d3a6cb75bbc04388e19e42bd021fb01d25c41758c1d4e816"
     }
   ],
+  "local_followup": {
+    "state": "DRAFT_HOLD",
+    "permit_id_uniqueness": {
+      "implementation": "SQLite issued_permit_ids and consumed_permit_ids tables",
+      "restart_persistence": "LOCAL_SINGLE_DATABASE_TESTED",
+      "cross_vm_guarantee": "NOT_CLAIMED"
+    },
+    "publisher_offline_gate": {
+      "path": "ops/command-tower/publisher_gate.py",
+      "signature_scheme": "Ed25519",
+      "signature_backend": "cryptography==50.0.2; fail closed if unavailable",
+      "trusted_keys_configured": false,
+      "test_only_signature_normal_path": "ops/command-tower/test_publisher_gate_crypto.py",
+      "normal_path_test_execution": "HOLD_PYPI_DNS_UNAVAILABLE",
+      "offline_only": true,
+      "github_write": false,
+      "successful_verification_authorizes_publication": false
+    },
+    "python_dependency": {
+      "requirements_file": "ops/command-tower/requirements-publisher.txt",
+      "cryptography_version": "50.0.2",
+      "isolated_virtualenv_install": "FAILED_PYPI_HOST_DNS_RESOLUTION",
+      "system_python_modified": false
+    },
+    "runner_integration": {
+      "independent_job_workflow": ".github/workflows/public-runner-draft.yml",
+      "trigger": "workflow_dispatch_only",
+      "jobs": ["worker", "publisher", "auditor"],
+      "all_jobs_hard_disabled": true,
+      "actions_commit_pins": true,
+      "artifact_builder": "ops/command-tower/runner_artifact.py",
+      "worker_publisher_auditor_byte_and_signature_gate": "IMPLEMENTED_LOCAL_DRAFT_NOT_EXECUTED",
+      "cross_job_and_cross_run_sqlite_journal": "HOLD",
+      "owner_public_keys": "NOT_CONFIGURED",
+      "worker_publisher_auditor_os_uid_separation": "NOT_CLAIMED"
+    },
+    "local_change_sha256": [
+      {
+        "path": ".github/workflows/public-runner-draft.yml",
+        "sha256": "5c9151dd9d75bddc38faea8baf1323c8890cbdd9fdcfb8c1341fff1a1973aa11"
+      },
+      {
+        "path": ".github/workflows/sandbox-pr-readonly.yml",
+        "sha256": "6d9f9f6ef8311aacb8a175373cd7f3090da30e0e79e04bb457ec8abaecb4465f"
+      },
+      {
+        "path": "ops/command-tower/requirements-publisher.txt",
+        "sha256": "02adaf6f1a02ce550200b0531bfcb9eda6d2353fc3d25d60e3a78400e888cfa6"
+      },
+      {
+        "path": "ops/command-tower/durable_store.py",
+        "sha256": "a06f955ba5bd6b9d3b93ba34fb5513ca2c376570bc245856eb9eb33ec8081546"
+      },
+      {
+        "path": "ops/command-tower/isolated_runtime.py",
+        "sha256": "50af520d9720d39982e46f4ed29d7f60e3de29981f5c1499446501380678e53b"
+      },
+      {
+        "path": "ops/command-tower/publisher_gate.py",
+        "sha256": "4fa8bcc6d53596bf6c937fe51ee19781baaf460f0c3a02ab365a93cc830ddd4b"
+      },
+      {
+        "path": "ops/command-tower/runner_artifact.py",
+        "sha256": "bbed4b5a3189d98fc5a66c6bf52c174b32e3019c8f10df097294465262eddb14"
+      },
+      {
+        "path": "ops/command-tower/test_durable_permit_identity.py",
+        "sha256": "cb95abe95877c98c88cc33d2caf89878be2bbbba6f4ce9375fc3a0dd3c6fde85"
+      },
+      {
+        "path": "ops/command-tower/test_publisher_gate.py",
+        "sha256": "882d5bde4304c99868d47a835b4c70f6d3550ac6a98772a2ec8ca4d358fb5dfa"
+      },
+      {
+        "path": "ops/command-tower/test_publisher_gate_crypto.py",
+        "sha256": "3e8a477cc0476e14de74e4d4840b81613d8ac569544acaff39e3f41d1babb7f7"
+      },
+      {
+        "path": "ops/command-tower/test_runner_artifact.py",
+        "sha256": "1a26357af6ca729ad5ba74755ad863cd6933f7689d5f66d7d899c5430fb83483"
+      },
+      {
+        "path": "ops/command-tower/test_public_runner_workflow_draft.py",
+        "sha256": "589ce1648f089cff9af28431c935472b83992fb2d4662dcdb35259253cfb8851"
+      }
+    ]
+  },
   "job_boundary": {
     "worker_job": "worker",
     "publisher_job": "publisher",

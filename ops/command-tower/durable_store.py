@@ -17,6 +17,14 @@ class PermitAlreadyConsumed(RuntimeError):
     """A durable permit digest has already been consumed."""
 
 
+class PermitIdAlreadyIssued(RuntimeError):
+    """A permit ID was already issued, regardless of the candidate digest."""
+
+
+class PermitIdAlreadyConsumed(RuntimeError):
+    """A permit ID was already consumed, regardless of its later payload."""
+
+
 class PersistentJournal:
     def __init__(self, store: "DurableStore") -> None:
         self._store = store
@@ -54,6 +62,8 @@ class DurableStore:
     """SQLite journal, atomic permit consumption, and restart fail-closed state."""
 
     PermitAlreadyConsumed = PermitAlreadyConsumed
+    PermitIdAlreadyIssued = PermitIdAlreadyIssued
+    PermitIdAlreadyConsumed = PermitIdAlreadyConsumed
 
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
@@ -68,6 +78,13 @@ class DurableStore:
             "previous_hash TEXT NOT NULL, entry_hash TEXT NOT NULL);"
             "CREATE TABLE IF NOT EXISTS consumed_permits ("
             "permit_digest TEXT PRIMARY KEY, consumed_at_entry INTEGER NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS issued_permit_ids ("
+            "permit_id TEXT PRIMARY KEY, candidate_digest TEXT NOT NULL, "
+            "permit_digest TEXT NOT NULL UNIQUE, issuer_id TEXT NOT NULL, "
+            "issued_at_entry INTEGER NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS consumed_permit_ids ("
+            "permit_id TEXT PRIMARY KEY, candidate_digest TEXT NOT NULL, "
+            "permit_digest TEXT NOT NULL UNIQUE, consumed_at_entry INTEGER NOT NULL);"
         )
         self.journal = PersistentJournal(self)
         self._recover_or_start()
@@ -123,23 +140,83 @@ class DurableStore:
 
     def consume_permit_and_record(self, permit_digest: str, **plan_payload: str) -> None:
         """Consume once and append both events in one durable transaction."""
+        permit_id = plan_payload.pop("permit_id", None)
+        candidate_digest = plan_payload.pop("candidate_digest", None)
         if not permit_digest:
             raise ValueError("permit digest is required")
+        if (permit_id is None) != (candidate_digest is None):
+            raise ValueError("permit ID and candidate digest must be supplied together")
         self._begin()
         try:
             if self.state != "DRAFT_HOLD":
                 raise RuntimeError("durable runtime is not active")
+            if permit_id is not None:
+                issued = self._connection.execute(
+                    "SELECT candidate_digest, permit_digest FROM issued_permit_ids WHERE permit_id=?",
+                    (permit_id,),
+                ).fetchone()
+                if issued and issued != (candidate_digest, permit_digest):
+                    raise PermitIdAlreadyIssued("permit ID is bound to another candidate")
+                used_id = self._connection.execute(
+                    "SELECT 1 FROM consumed_permit_ids WHERE permit_id=?", (permit_id,)
+                ).fetchone()
+                if used_id:
+                    raise PermitIdAlreadyConsumed("permit ID was already consumed")
             cursor = self._connection.execute(
                 "SELECT 1 FROM consumed_permits WHERE permit_digest=?", (permit_digest,)
             ).fetchone()
             if cursor:
-                raise PermitAlreadyConsumed(permit_digest)
-            consumed_entry = self._append_in_transaction("PERMIT_CONSUMED", permit_digest=permit_digest)
+                raise PermitAlreadyConsumed("permit digest was already consumed")
+            consume_payload = {"permit_digest": permit_digest}
+            if permit_id is not None:
+                consume_payload.update(permit_id=permit_id, candidate_digest=candidate_digest)
+            consumed_entry = self._append_in_transaction("PERMIT_CONSUMED", **consume_payload)
             self._connection.execute(
                 "INSERT INTO consumed_permits(permit_digest, consumed_at_entry) VALUES (?, ?)",
                 (permit_digest, consumed_entry.sequence),
             )
+            if permit_id is not None:
+                self._connection.execute(
+                    "INSERT INTO consumed_permit_ids(permit_id, candidate_digest, permit_digest, consumed_at_entry) "
+                    "VALUES (?, ?, ?, ?)",
+                    (permit_id, candidate_digest, permit_digest, consumed_entry.sequence),
+                )
             self._append_in_transaction("LOCAL_PLAN_PREPARED", **plan_payload)
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def record_permit_issuance(self, permit_id: str, candidate_digest: str,
+                               permit_digest: str, issuer_id: str) -> None:
+        """Durably reserve an ID once, atomically with its journal entry."""
+        if not all((permit_id, candidate_digest, permit_digest, issuer_id)):
+            raise ValueError("permit issuance fields are required")
+        self._begin()
+        try:
+            if self.state != "DRAFT_HOLD":
+                raise RuntimeError("durable runtime is not active")
+            existing = self._connection.execute(
+                "SELECT candidate_digest, permit_digest FROM issued_permit_ids WHERE permit_id=?",
+                (permit_id,),
+            ).fetchone()
+            if existing:
+                raise PermitIdAlreadyIssued("permit ID was already issued")
+            digest_exists = self._connection.execute(
+                "SELECT 1 FROM issued_permit_ids WHERE permit_digest=?", (permit_digest,)
+            ).fetchone()
+            if digest_exists:
+                raise PermitIdAlreadyIssued("permit digest was already issued")
+            entry = self._append_in_transaction(
+                "PERMIT_ID_RESERVED", permit_id=permit_id, candidate_digest=candidate_digest,
+                permit_digest=permit_digest, issuer_id=issuer_id,
+            )
+            self._connection.execute(
+                "INSERT INTO issued_permit_ids"
+                "(permit_id, candidate_digest, permit_digest, issuer_id, issued_at_entry) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (permit_id, candidate_digest, permit_digest, issuer_id, entry.sequence),
+            )
             self._connection.execute("COMMIT")
         except Exception:
             self._connection.execute("ROLLBACK")

@@ -1,0 +1,116 @@
+{
+  "schema": 1,
+  "candidate_id": "b09-public-runner-policy-v1",
+  "state": "DRAFT_HOLD",
+  "signed": false,
+  "signature": null,
+  "approval": {
+    "owner_a": "NOT_APPROVED",
+    "owner_b": "NOT_APPROVED"
+  },
+  "repository": {
+    "full_name": "not60/sake-autonomy-public-sandbox-20261115",
+    "id": 1458303357,
+    "base_ref": "refs/heads/main",
+    "observed_main_sha": "450fad253188850c3cf742d55713650cba165f96"
+  },
+  "legacy_source": {
+    "repository": "not60/sake-tasting-log",
+    "source_sha": "34fb092782af9dcd86577f3425820157c183d6a3",
+    "policy_mode": "PREFLIGHT_ONLY",
+    "authorization_reused": false
+  },
+  "execution": {
+    "enabled": false,
+    "formal_worker_enabled": false,
+    "external_write_enabled": false,
+    "execution_boundary_candidate": "fresh_github_hosted_vm_per_job",
+    "host_os_uid_separation": "NOT_CLAIMED",
+    "runner_label": "ubuntu-latest",
+    "runner_class": "standard_github_hosted_vm_not_ubuntu_slim",
+    "network": "HOLD_UNTIL_SIGNED_POLICY_AND_RUNNER_CONTROLS_ARE_APPROVED"
+  },
+  "roles": [
+    {
+      "role": "worker",
+      "job_id": "worker",
+      "responsibility": "Codex execution and candidate artifact only",
+      "github_permissions": {
+        "contents": "read",
+        "pull_requests": "none",
+        "actions": "none"
+      },
+      "codex_action": {
+        "repository": "openai/codex-action",
+        "immutable_commit_pin": "REQUIRED_BEFORE_SIGNATURE",
+        "api_key_secret_name": "OPENAI_API_KEY",
+        "secret_state": "EXISTENCE_UNVERIFIED_NOT_CREATED_OR_READ",
+        "exposure_scope": "worker_job_only",
+        "sandbox_candidate": "workspace-write"
+      },
+      "outputs": ["candidate.patch", "manifest.json", "sha256sums.txt"]
+    },
+    {
+      "role": "publisher",
+      "job_id": "publisher",
+      "responsibility": "Re-hash and validate worker artifact; create draft PR only after signed gates",
+      "github_permissions": {
+        "contents": "write",
+        "pull_requests": "write",
+        "actions": "none"
+      },
+      "credential_candidate": {
+        "type": "repository_scoped_github_app_installation_token_or_fine_grained_pat",
+        "repository_scope": "not60/sake-autonomy-public-sandbox-20261115_only",
+        "permissions": ["contents:write", "pull_requests:write"],
+        "status": "NOT_ISSUED_NOT_CONFIGURED"
+      },
+      "pull_request_ci": {
+        "preferred_auth": "github_app_or_repository_scoped_pat",
+        "reason": "GITHUB_TOKEN-created pull_request workflow runs require approval",
+        "workflow": ".github/workflows/sandbox-pr-readonly.yml",
+        "dispatch_or_status_reporter_job": "NOT_PROPOSED"
+      }
+    },
+    {
+      "role": "auditor",
+      "job_id": "auditor",
+      "responsibility": "Independent read-only verification of artifact, PR head, and journal snapshot",
+      "github_permissions": {
+        "contents": "read",
+        "pull_requests": "read",
+        "actions": "read"
+      },
+      "secrets": [],
+      "write_permissions": []
+    }
+  ],
+  "artifact_gate": {
+    "fail_closed": true,
+    "required_manifest_fields": [
+      "schema",
+      "repository_id",
+      "base_sha",
+      "worker_run_id",
+      "candidate_sha256",
+      "changed_paths",
+      "permit_digest",
+      "witness_digest",
+      "policy_sha256",
+      "runtime_sha256",
+      "backlog_sha256"
+    ],
+    "publisher_rechecks_downloaded_bytes": true,
+    "auditor_recomputes_hashes_independently": true,
+    "permit_and_witness_signature_scheme": "UNRESOLVED_NO_CRYPTOGRAPHIC_SIGNER_CONFIGURED",
+    "sqlite_cross_job_and_cross_run_durability": "UNRESOLVED_LOCAL_SQLITE_IS_NOT_SHARED_BETWEEN_RUNNER_VMS"
+  },
+  "go_gates": [
+    "exact_signed_policy_runtime_backlog_hashes_and_signatures",
+    "owner_a_and_owner_b_approval_of_runner_vm_boundary",
+    "worker_only_codex_credential_availability_without_new_secret_creation",
+    "publisher_only_repository_credential_and_repository_actions_pr_creation_setting",
+    "cryptographic_permit_witness_and_durable_journal_transport",
+    "local_contract_tests_then_separately_approved_draft_pr_and_ci"
+  ]
+}

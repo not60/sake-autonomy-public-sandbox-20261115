@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "candidate_id": "b09-public-runner-runtime-v1",
+  "state": "DRAFT_HOLD",
+  "signed": false,
+  "signature": null,
+  "policy_candidate_id": "b09-public-runner-policy-v1",
+  "enabled": false,
+  "repository_id": 1458303357,
+  "repository": "not60/sake-autonomy-public-sandbox-20261115",
+  "base_ref": "refs/heads/main",
+  "reused_local_runtime": [
+    {
+      "path": "ops/command-tower/isolated_runtime.py",
+      "sha256": "137a548b641e0c2f102cab6580f3d10e212e3465fcdb7fb31dadccee93a99acc"
+    },
+    {
+      "path": "ops/command-tower/durable_store.py",
+      "sha256": "6bcdda43761650be0100b144da6d0e6bc2690d4aba581cfde50bb2696f4577b6"
+    },
+    {
+      "path": "ops/command-tower/test_process_crash_recovery.py",
+      "sha256": "611a37b4d990d9a9d3a6cb75bbc04388e19e42bd021fb01d25c41758c1d4e816"
+    }
+  ],
+  "job_boundary": {
+    "worker_job": "worker",
+    "publisher_job": "publisher",
+    "auditor_job": "auditor",
+    "each_job_uses_fresh_standard_github_hosted_vm": true,
+    "numeric_uid_uniqueness_across_vms": "NOT_A_SECURITY_CLAIM",
+    "same_job_filesystem_or_sqlite_connection_shared": false
+  },
+  "permit": {
+    "single_use": true,
+    "binds": [
+      "policy_sha256",
+      "runtime_sha256",
+      "backlog_sha256",
+      "repository_id",
+      "base_sha",
+      "candidate_sha256",
+      "changed_paths",
+      "worker_run_id"
+    ],
+    "consumption_transaction": "existing SQLite DurableStore transaction",
+    "cross_job_state": "HOLD_UNTIL_SIGNED_SNAPSHOT_OR_TRUSTED_DURABLE_STORE_EXISTS"
+  },
+  "witness": {
+    "binds_permit_digest_and_candidate_sha256": true,
+    "must_be_independent_of_worker_and_publisher": true,
+    "signature_verification": "HOLD_NO_SIGNING_OR_VERIFICATION_KEY_CONFIGURED"
+  },
+  "journal": {
+    "implementation": "existing SQLite DurableStore hash chain",
+    "per_job_database": "ephemeral_runner_local_file",
+    "snapshot_transfer": "untrusted_artifact_rehashed_by_publisher_and_auditor",
+    "tamper_resistance_against_same_job_identity": "NOT_CLAIMED",
+    "cross_run_retention_and_replay_protection": "HOLD_UNRESOLVED"
+  },
+  "safe_stop": {
+    "on_missing_or_invalid_policy": true,
+    "on_base_sha_change": true,
+    "on_artifact_hash_or_path_mismatch": true,
+    "on_missing_or_invalid_permit_or_witness": true,
+    "on_journal_or_sqlite_recovery_failure": true,
+    "on_unexpected_credential_or_permission": true,
+    "on_cross_job_snapshot_or_parent_mismatch": true
+  },
+  "external_effects": {
+    "github_write": false,
+    "pull_request_creation": false,
+    "actions_dispatch": false,
+    "formal_worker_start": false
+  }
+}

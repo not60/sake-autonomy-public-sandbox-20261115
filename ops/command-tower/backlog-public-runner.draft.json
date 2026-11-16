@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "candidate_id": "b09-public-runner-backlog-v1",
+  "state": "DRAFT_HOLD",
+  "signed": false,
+  "signature": null,
+  "policy_candidate_id": "b09-public-runner-policy-v1",
+  "runtime_candidate_id": "b09-public-runner-runtime-v1",
+  "repository_id": 1458303357,
+  "repository": "not60/sake-autonomy-public-sandbox-20261115",
+  "tasks": [
+    {
+      "id": "runner-policy-review",
+      "state": "HOLD",
+      "scope": "Compare exact signed Policy/Runtime/Backlog sources and Owner A/B signatures against the public runner candidates.",
+      "requires": ["source_sha256s", "signature_verification", "owner_a_approval", "owner_b_approval"]
+    },
+    {
+      "id": "worker-credential-boundary",
+      "state": "HOLD",
+      "scope": "Confirm an already-existing Worker-only Codex credential; do not create or expose a secret.",
+      "requires": ["worker_only_secret_presence_confirmation", "immutable_codex_action_commit_pin"]
+    },
+    {
+      "id": "publisher-and-pr-ci-boundary",
+      "state": "HOLD",
+      "scope": "Select a single-repository GitHub App token or fine-grained PAT for Publisher and confirm Actions can create PRs.",
+      "requires": ["publisher_only_credential", "repo_scope_readback", "workflow_permissions_readback"]
+    },
+    {
+      "id": "permit-witness-journal-transport",
+      "state": "HOLD",
+      "scope": "Define cryptographic Permit/Witness verification and cross-job, cross-run SQLite journal snapshot retention and replay recovery.",
+      "requires": ["signed_attestation_contract", "durable_snapshot_parent_chain", "recovery_tests"]
+    },
+    {
+      "id": "local-runner-contract-tests",
+      "state": "READY_FOR_LOCAL_ONLY_TESTS",
+      "scope": "Validate candidate Policy/Runtime/Backlog consistency without network, credentials, or Worker execution.",
+      "requires": []
+    },
+    {
+      "id": "draft-pr-and-ci-cycle-1",
+      "state": "NOT_AUTHORIZED",
+      "scope": "Create a genuine Draft PR and read back the existing pull_request CI result after all signed GO gates pass.",
+      "requires": ["owner_a_and_b_formal_go", "publisher_credential", "explicit_pr_and_actions_authorization"]
+    },
+    {
+      "id": "worker-cycle-2",
+      "state": "NOT_AUTHORIZED",
+      "scope": "Run a second sequential Worker cycle only after cycle 1 independent audit and safe stop readback.",
+      "requires": ["cycle_1_audit_pass", "permit_and_journal_continuity", "explicit_worker_authorization"]
+    }
+  ],
+  "status": {
+    "stage2": "NO_GO",
+    "worker_success_count": "0/2"
+  }
+}

@@ -58,6 +58,7 @@ class FakeApi:
         self.unknown_commit = False
         self.concurrent_head_change = False
         self.api_rejects_commit = False
+        self.open_pr_exists = False
 
     def get_repository(self, repository_id: int) -> RepositorySnapshot:
         return RepositorySnapshot(repository_id, PUBLIC_REPOSITORY, False)
@@ -75,7 +76,15 @@ class FakeApi:
         return BranchSnapshot(branch, self.head_sha, BASE_SHA, dict(self.file_sha256))
 
     def find_open_pull_request(self, repository_id: int, head: str, base: str) -> bool:
-        return False
+        return self.open_pr_exists
+
+    def get_open_draft_pull_request(self, repository_id: int, head: str,
+                                    base: str) -> DraftPrCreated:
+        return DraftPrCreated(
+            PUBLIC_REPOSITORY_ID, 1,
+            "https://github.com/not60/sake-autonomy-public-sandbox-20261115/pull/1",
+            PUBLIC_HEAD_BRANCH, PUBLIC_BASE_BRANCH, True, self.head_sha, BASE_SHA,
+        )
 
     def execute_graphql(self, query: str,
                         variables: dict[str, object]) -> dict[str, object]:
@@ -97,8 +106,8 @@ class FakeApi:
         additions = input_value["fileChanges"]["additions"]
         files = {item["path"]: base64.b64decode(item["contents"])
                  for item in additions}
-        self.file_sha256 = {path: hashlib.sha256(data).hexdigest()
-                            for path, data in files.items()}
+        self.file_sha256.update({path: hashlib.sha256(data).hexdigest()
+                                 for path, data in files.items()})
         self.head_sha = NEW_HEAD
         return {"data": {"createCommitOnBranch": {"commit": {
             "oid": NEW_HEAD,
@@ -108,8 +117,9 @@ class FakeApi:
     def create_draft_pull_request(self, request: DraftPrRequest) -> DraftPrCreated:
         self.pr_calls.append(request)
         return DraftPrCreated(
-            PUBLIC_REPOSITORY_ID, 19, "https://github.com/not60/example/pull/19",
-            PUBLIC_HEAD_BRANCH, PUBLIC_BASE_BRANCH, True,
+            PUBLIC_REPOSITORY_ID, 19,
+            "https://github.com/not60/sake-autonomy-public-sandbox-20261115/pull/19",
+            PUBLIC_HEAD_BRANCH, PUBLIC_BASE_BRANCH, True, self.head_sha, BASE_SHA,
         )
 
 
@@ -163,6 +173,23 @@ class PublisherBranchCommitTests(unittest.TestCase):
             self.run_candidate(expected_head="f" * 40)
         self.assertEqual(self.api.graphql_calls, [])
         self.assertEqual(self.api.pr_calls, [])
+
+    def test_existing_draft_pr_is_updated_without_creating_duplicate(self) -> None:
+        self.api.open_pr_exists = True
+        result = self.run_candidate()
+        self.assertEqual(len(self.api.graphql_calls), 1)
+        self.assertEqual(self.api.pr_calls, [])
+        self.assertEqual(result.number, 1)
+        self.assertEqual(result.head_sha, NEW_HEAD)
+
+    def test_commit_preserves_preexisting_allowlisted_branch_files(self) -> None:
+        previous_path = "ops/command-tower/attestations.py"
+        previous_sha = "e" * 64
+        self.api.file_sha256[previous_path] = previous_sha
+        result = self.run_candidate()
+        self.assertEqual(result.head_sha, NEW_HEAD)
+        self.assertEqual(self.api.file_sha256[previous_path], previous_sha)
+        self.assertIn(RELATIVE, self.api.file_sha256)
 
     def test_out_of_allowlist_path_holds_before_commit(self) -> None:
         illegal = "README.md"

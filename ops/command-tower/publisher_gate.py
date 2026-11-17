@@ -20,6 +20,7 @@ from durable_store import (
     PermitIdAlreadyConsumed,
     PermitIdAlreadyIssued,
 )
+from trusted_key_registry import TrustedVerificationKey, load_trusted_verification_keys
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -36,13 +37,6 @@ class PublisherGateHold(RuntimeError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
-
-
-@dataclass(frozen=True)
-class TrustedVerificationKey:
-    key_id: str
-    role: str
-    public_key: bytes
 
 
 @dataclass(frozen=True)
@@ -484,9 +478,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allowed-path", required=True, action="append")
     parser.add_argument("--cas-endpoint", default="")
     parser.add_argument("--role", choices=("publisher", "auditor"), default="publisher")
+    parser.add_argument("--draft-pr-write", action="store_true",
+                        help="request one scoped Draft PR after every existing Publisher gate passes")
+    parser.add_argument("--expected-head-sha", default="",
+                        help="optional pinned review HEAD; otherwise read once before the atomic write")
+    parser.add_argument("--audit-pr-ci", action="store_true",
+                        help="read one existing pull_request run for the exact Draft PR head")
+    parser.add_argument("--pull-request-number", type=int, default=0)
+    parser.add_argument("--expected-pr-head-sha", default="",
+                        help="required pinned PR head for read-only CI evidence")
+    parser.add_argument("--expected-pr-base-sha", default="",
+                        help="required pinned PR base for read-only CI evidence")
     args = parser.parse_args(argv)
+    from draft_pr_writer import DraftPrWriter, GitHubDraftPrApi, WriterHold
+
     store: DurableStore | None = None
     try:
+        if args.draft_pr_write and args.role != "publisher":
+            raise PublisherGateHold("auditor_cannot_request_github_write")
+        if args.audit_pr_ci and (args.role != "auditor" or args.pull_request_number != 1):
+            raise PublisherGateHold("readonly_ci_audit_scope_invalid")
+        if args.audit_pr_ci and not _GIT_SHA.fullmatch(args.expected_pr_head_sha):
+            raise PublisherGateHold("readonly_ci_expected_head_invalid")
+        if args.audit_pr_ci and not _GIT_SHA.fullmatch(args.expected_pr_base_sha):
+            raise PublisherGateHold("readonly_ci_expected_base_invalid")
+        if not args.audit_pr_ci and args.expected_pr_head_sha:
+            raise PublisherGateHold("expected_pr_head_without_ci_audit")
+        if not args.audit_pr_ci and args.expected_pr_base_sha:
+            raise PublisherGateHold("expected_pr_base_without_ci_audit")
+        if not args.audit_pr_ci and args.pull_request_number:
+            raise PublisherGateHold("pull_request_number_without_ci_audit")
+        if args.expected_head_sha and not _GIT_SHA.fullmatch(args.expected_head_sha):
+            raise PublisherGateHold("draft_pr_expected_head_invalid")
+        if not args.draft_pr_write and args.expected_head_sha:
+            raise PublisherGateHold("expected_head_without_write_request")
         token_name = "B09_CAS_TOKEN" if args.role == "publisher" else "B09_CAS_READ_TOKEN"
         token = os.environ.get(token_name, "")
         if not args.cas_endpoint or not token:
@@ -496,16 +521,7 @@ def main(argv: list[str] | None = None) -> int:
         witness = json.loads(Path(args.witness).read_text(encoding="utf-8"))
         approvals = json.loads(Path(args.owner_approvals).read_text(encoding="utf-8"))
         key_document = json.loads(Path(args.trusted_keys).read_text(encoding="utf-8"))
-        if not isinstance(key_document, dict) or set(key_document) != {"keys"} or not isinstance(key_document["keys"], list):
-            raise ValueError("invalid trusted-key document")
-        keys: dict[str, TrustedVerificationKey] = {}
-        for item in key_document["keys"]:
-            if not isinstance(item, dict) or set(item) != {"key_id", "role", "public_key"}:
-                raise ValueError("invalid trusted-key entry")
-            key_id, role, encoded = item["key_id"], item["role"], item["public_key"]
-            if not all(isinstance(value, str) and value for value in (key_id, role, encoded)) or key_id in keys:
-                raise ValueError("invalid trusted-key values")
-            keys[key_id] = TrustedVerificationKey(key_id, role, base64.b64decode(encoded, validate=True))
+        keys = load_trusted_verification_keys(key_document)
         store = DurableStore(args.database)
         gate = PublisherGate(
             repository_id=args.repository_id, base_sha=args.base_sha,
@@ -521,8 +537,36 @@ def main(argv: list[str] | None = None) -> int:
             witness=witness, codex_output_file=args.codex_output,
             owner_approvals=approvals,
         )
+        draft_result = None
+        ci_result = None
         if args.role == "publisher":
-            prepare_draft_pr_plan(result)
+            plan = prepare_draft_pr_plan(result)
+            if args.draft_pr_write:
+                github_token = os.environ.get("B09_PUBLISHER_GITHUB_TOKEN", "")
+                if not github_token:
+                    raise WriterHold("publisher_github_credential_missing")
+                api = GitHubDraftPrApi(github_token)
+                expected_head = args.expected_head_sha or api.get_branch(
+                    PUBLIC_REPOSITORY_ID, PUBLIC_HEAD_BRANCH,
+                ).sha
+                draft_result = DraftPrWriter(api).commit_verified_artifact_and_create_draft(
+                    plan, artifact_root=args.artifact_root,
+                    expected_head_sha=expected_head,
+                )
+        elif args.role == "auditor" and args.audit_pr_ci:
+            if args.expected_pr_base_sha != result.base_sha:
+                raise PublisherGateHold("readonly_ci_pr_base_not_bound_to_artifact")
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+            if not github_token:
+                raise WriterHold("auditor_github_token_missing")
+            ci_result = GitHubDraftPrApi(github_token).wait_for_readonly_ci_run(
+                args.pull_request_number, args.expected_pr_head_sha, args.expected_pr_base_sha,
+            )
+            if ci_result.status != "completed" or ci_result.conclusion != "success":
+                raise WriterHold("readonly_ci_not_success")
+    except WriterHold as exc:
+        print(f"HOLD:{exc.reason}", file=sys.stderr)
+        return 2
     except PublisherGateHold as exc:
         print(f"HOLD:{exc.reason}", file=sys.stderr)
         return 2
@@ -535,10 +579,20 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if store is not None:
             store.close()
-    print("DRAFT_PR_PLAN_READY_NO_GITHUB_WRITE" if args.role == "publisher"
-          else "AUDIT_VERIFIED_READ_ONLY")
+    if args.role == "auditor":
+        if ci_result is None:
+            print("AUDIT_VERIFIED_READ_ONLY")
+        else:
+            print(f"AUDIT_AND_READONLY_CI_PASS:{ci_result.run_id}:{ci_result.url}")
+    elif draft_result is None:
+        print("DRAFT_PR_PLAN_READY_NO_GITHUB_WRITE")
+    else:
+        print(f"DRAFT_PR_CREATED:{draft_result.number}:{draft_result.head_sha}:{draft_result.base_sha}:{draft_result.url}")
     return 0
 
 
 if __name__ == "__main__":
+    # Keep the gate seal and DraftPrPlan class identity shared with the
+    # lazily imported writer when this file is executed as a script.
+    sys.modules.setdefault("publisher_gate", sys.modules[__name__])
     raise SystemExit(main())

@@ -64,6 +64,21 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         self.assertLess(install, tests)
         self.assertIn("persist-credentials: false", source)
 
+    def test_publisher_writer_is_connected_but_remains_hard_disabled(self) -> None:
+        source = DRAFT_WORKFLOW.read_text(encoding="utf-8")
+        publisher = section(source, "publisher", "auditor")
+        self.assertIn("if: ${{ false && needs.worker.result == 'success' }}", publisher)
+        self.assertIn("B09_PUBLISHER_GITHUB_TOKEN: ${{ secrets.B09_PUBLISHER_GITHUB_TOKEN }}", publisher)
+        self.assertIn("--draft-pr-write", publisher)
+        self.assertIn("pr_head_sha: ${{ steps.publish.outputs.pr_head_sha }}", publisher)
+        self.assertIn("result=\"$(python ops/command-tower/publisher_gate.py", publisher)
+        self.assertIn("--trusted-keys", publisher)
+        self.assertIn("B09_CAS_TOKEN: ${{ secrets.B09_CAS_TOKEN }}", publisher)
+        auditor = section(source, "auditor", None)
+        self.assertIn("GITHUB_TOKEN: ${{ github.token }}", auditor)
+        self.assertIn("--audit-pr-ci", auditor)
+        self.assertIn("--expected-pr-head-sha", auditor)
+
 
 if __name__ == "__main__":
     unittest.main()

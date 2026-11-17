@@ -73,8 +73,9 @@ class FakeApi:
         if self.unknown_result:
             raise ClientOutcomeUnknown("offline simulated ambiguous response")
         return DraftPrCreated(
-            PUBLIC_REPOSITORY_ID, 17, "https://github.com/not60/example/pull/17",
-            PUBLIC_HEAD_BRANCH, PUBLIC_BASE_BRANCH, True,
+            PUBLIC_REPOSITORY_ID, 17,
+            "https://github.com/not60/sake-autonomy-public-sandbox-20261115/pull/17",
+            PUBLIC_HEAD_BRANCH, PUBLIC_BASE_BRANCH, True, "d" * 40, BASE_SHA,
         )
 
 

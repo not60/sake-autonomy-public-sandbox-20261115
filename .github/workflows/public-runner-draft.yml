@@ -89,6 +89,10 @@ jobs:
 
   publisher:
     needs: worker
+    outputs:
+      pr_number: ${{ steps.publish.outputs.pr_number }}
+      pr_head_sha: ${{ steps.publish.outputs.pr_head_sha }}
+      pr_base_sha: ${{ steps.publish.outputs.pr_base_sha }}
     # Hard stop. This role is only a permission candidate; it has no write step.
     if: ${{ false && needs.worker.result == 'success' }}
     runs-on: ubuntu-latest
@@ -114,9 +118,11 @@ jobs:
           name: b09-public-runner-candidate
           path: ${{ runner.temp }}/b09-bundle
       - name: Verify exact bytes, Permit, Witness, and durable single use
+        id: publish
         env:
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
           B09_CAS_TOKEN: ${{ secrets.B09_CAS_TOKEN }}
+          B09_PUBLISHER_GITHUB_TOKEN: ${{ secrets.B09_PUBLISHER_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           printf '{"keys":[]}\n' > "$RUNNER_TEMP/b09-empty-trusted-keys.json"
@@ -143,7 +149,7 @@ jobs:
           )
           args=()
           for path in "${allowed_paths[@]}"; do args+=(--allowed-path "$path"); done
-          python ops/command-tower/publisher_gate.py \
+          result="$(python ops/command-tower/publisher_gate.py \
             --artifact-root "$RUNNER_TEMP/b09-bundle/files" \
             --manifest "$RUNNER_TEMP/b09-bundle/manifest.json" \
             --permit "$RUNNER_TEMP/b09-bundle/permit.json" \
@@ -156,7 +162,17 @@ jobs:
             --base-sha "$GITHUB_SHA" \
             --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
             --role publisher \
-            "${args[@]}"
+            --draft-pr-write \
+            "${args[@]}")"
+          printf '%s\n' "$result"
+          if [[ "$result" =~ ^DRAFT_PR_CREATED:([0-9]+):([0-9a-f]{40}):([0-9a-f]{40}):https://github\.com/not60/sake-autonomy-public-sandbox-20261115/pull/[0-9]+$ ]]; then
+            printf 'pr_number=%s\n' "${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            printf 'pr_head_sha=%s\n' "${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+            printf 'pr_base_sha=%s\n' "${BASH_REMATCH[3]}" >> "$GITHUB_OUTPUT"
+          else
+            echo 'HOLD: publisher did not return a validated Draft PR reference.' >&2
+            exit 78
+          fi
 
   auditor:
     needs: [worker, publisher]
@@ -188,6 +204,10 @@ jobs:
         env:
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
           B09_CAS_READ_TOKEN: ${{ secrets.B09_CAS_READ_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          B09_PR_NUMBER: ${{ needs.publisher.outputs.pr_number }}
+          B09_PR_HEAD_SHA: ${{ needs.publisher.outputs.pr_head_sha }}
+          B09_PR_BASE_SHA: ${{ needs.publisher.outputs.pr_base_sha }}
         run: |
           set -euo pipefail
           printf '{"keys":[]}\n' > "$RUNNER_TEMP/b09-empty-trusted-keys.json"
@@ -227,4 +247,8 @@ jobs:
             --base-sha "$GITHUB_SHA" \
             --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
             --role auditor \
+            --audit-pr-ci \
+            --pull-request-number "$B09_PR_NUMBER" \
+            --expected-pr-head-sha "$B09_PR_HEAD_SHA" \
+            --expected-pr-base-sha "$B09_PR_BASE_SHA" \
             "${args[@]}"

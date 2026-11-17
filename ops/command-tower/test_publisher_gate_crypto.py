@@ -12,7 +12,8 @@ from attestations import canonical_json, issue_permit, issue_witness, sign_envel
 from cas_journal import PermitCasJournal
 from durable_store import DurableStore
 from publisher_gate import (
-    PublisherGate, PublisherGateHold, TrustedVerificationKey, prepare_draft_pr_plan,
+    PublisherGate, PublisherGateHold, TrustedVerificationKey,
+    is_gate_approved_draft_pr_plan, prepare_draft_pr_plan,
 )
 from test_cas_journal import MemoryCasBackend
 
@@ -111,7 +112,9 @@ class PublisherGateCryptoTests(unittest.TestCase):
         self.assertTrue(result.draft_pr_ready)
         self.assertFalse(result.publication_authorized)
         plan = prepare_draft_pr_plan(result)
-        self.assertFalse(plan.create_enabled)
+        self.assertTrue(is_gate_approved_draft_pr_plan(plan))
+        self.assertTrue(plan.draft_pr_ready)
+        self.assertFalse(result.publication_authorized)
         self.assertEqual(plan.changed_paths, (PATH,))
         self.assertEqual(self.journal.snapshot().sequence, 2)
         self.assertEqual(self.store.state, "DRAFT_HOLD")
@@ -163,8 +166,10 @@ class PublisherGateCryptoTests(unittest.TestCase):
 
     def test_stale_journal_witness_is_rejected(self) -> None:
         self.journal.record_issuance(
-            permit_id="intervening", candidate_digest="x" * 64,
-            permit_digest="y" * 64, worker_run_id="other-run",
+            permit_id="intervening",
+            candidate_digest=hashlib.sha256(b"intervening candidate").hexdigest(),
+            permit_digest=hashlib.sha256(b"intervening permit").hexdigest(),
+            worker_run_id="other-run",
         )
         with self.assertRaisesRegex(PublisherGateHold, "witness_journal_parent_mismatch"):
             self.verify(gate=self._gate(self._new_store("stale.sqlite3")))

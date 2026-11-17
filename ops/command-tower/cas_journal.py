@@ -97,12 +97,25 @@ class CasSnapshot:
 class PermitCasJournal:
     """Append-only repository journal and cross-run Permit-ID registry."""
 
-    def __init__(self, backend: CasBackend, *, repository_id: int) -> None:
+    TEST_REPOSITORY_ID = 1458303357
+    TEST_ID_PREFIX = "TEST:"
+
+    def __init__(self, backend: CasBackend, *, repository_id: int,
+                 mode: str = "formal") -> None:
         if isinstance(repository_id, bool) or repository_id <= 0:
             raise ValueError("repository ID must be positive")
+        if mode not in {"formal", "test"}:
+            raise ValueError("CAS journal mode must be formal or test")
+        if mode == "test" and repository_id != self.TEST_REPOSITORY_ID:
+            raise ValueError("TEST CAS is fixed to the public sandbox repository")
         self._backend = backend
         self.repository_id = repository_id
-        self._key = f"repositories/{repository_id}/b09-permit-journal-v1.json"
+        self.mode = mode
+        suffix = (
+            "b09-permit-journal-test-v1.json"
+            if mode == "test" else "b09-permit-journal-v1.json"
+        )
+        self._key = f"repositories/{repository_id}/{suffix}"
 
     def snapshot(self) -> CasSnapshot:
         stored = self._backend.read(self._key)
@@ -128,6 +141,8 @@ class PermitCasJournal:
             if (event["sequence"] != sequence or event["previous_sha256"] != previous
                     or event["event_sha256"] != digest or not isinstance(event["payload"], dict)):
                 raise CasHold("cas_journal_chain_invalid")
+            payload = event["payload"]
+            self._validate_mode_ids(payload.get("permit_id"), payload.get("worker_run_id"))
             previous = digest
         if document["sequence"] != len(events) or document["head_sha256"] != previous:
             raise CasHold("cas_journal_head_invalid")
@@ -139,6 +154,7 @@ class PermitCasJournal:
         if (not permit_id or not worker_run_id or not _sha(candidate_digest)
                 or not _sha(permit_digest)):
             raise CasHold("permit_issuance_scope_invalid")
+        self._validate_mode_ids(permit_id, worker_run_id)
         current = self.snapshot()
         if self._permit_events(current, permit_id):
             raise CasHold("permit_id_reused_across_runs")
@@ -156,6 +172,7 @@ class PermitCasJournal:
                 or not _sha(permit_digest) or not _sha(witness_digest)
                 or not _sha(expected_parent)):
             raise CasHold("permit_consumption_scope_invalid")
+        self._validate_mode_ids(permit_id, worker_run_id)
         current = self.snapshot()
         if current.head_sha256 != expected_parent:
             raise CasConflict("witness_journal_parent_mismatch")
@@ -194,6 +211,17 @@ class PermitCasJournal:
             if isinstance(payload, dict) and payload.get("permit_id") == permit_id:
                 result.append(payload)
         return result
+
+    def _validate_mode_ids(self, permit_id: object, worker_run_id: object) -> None:
+        if not isinstance(permit_id, str) or not isinstance(worker_run_id, str):
+            raise CasHold("cas_journal_mode_scope_invalid")
+        test_scoped = (permit_id.startswith(self.TEST_ID_PREFIX)
+                       and worker_run_id.startswith(self.TEST_ID_PREFIX))
+        formal_scoped = (not permit_id.startswith(self.TEST_ID_PREFIX)
+                         and not worker_run_id.startswith(self.TEST_ID_PREFIX))
+        if ((self.mode == "test" and not test_scoped)
+                or (self.mode == "formal" and not formal_scoped)):
+            raise CasHold("cas_journal_mode_scope_invalid")
 
 
 def _canonical(value: object) -> bytes:

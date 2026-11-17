@@ -1,0 +1,3 @@
+# LOCAL DRAFT ONLY. Edge app-layer opaque Bearer auth is mandatory for all methods.
+[functions.sake-cas-v1]
+verify_jwt = false

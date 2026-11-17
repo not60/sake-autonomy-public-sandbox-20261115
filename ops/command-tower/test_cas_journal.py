@@ -94,6 +94,53 @@ class PermitCasJournalTests(unittest.TestCase):
         with self.assertRaisesRegex(CasHold, "cas_journal_chain_invalid"):
             self.publisher.snapshot()
 
+    def test_test_mode_is_persisted_under_separate_key_with_test_scoped_ids(self) -> None:
+        test_issuer = PermitCasJournal(
+            self.backend, repository_id=1458303357, mode="test",
+        )
+        test_publisher = PermitCasJournal(
+            self.backend, repository_id=1458303357, mode="test",
+        )
+        test_issued = test_issuer.record_issuance(
+            permit_id="TEST:permit-1", candidate_digest="c" * 64,
+            permit_digest="d" * 64, worker_run_id="TEST:run-1",
+        )
+        test_consumed = test_publisher.record_consumption(
+            permit_id="TEST:permit-1", candidate_digest="c" * 64,
+            permit_digest="d" * 64, witness_digest="e" * 64,
+            worker_run_id="TEST:run-1", expected_parent=test_issued.head_sha256,
+        )
+        self.assertEqual(test_consumed.sequence, 2)
+        self.assertEqual(set(self.backend.objects), {
+            "repositories/1458303357/b09-permit-journal-test-v1.json",
+        })
+        self.assertEqual(self.authority.snapshot().sequence, 0)
+        self.assertEqual(test_issuer.snapshot().sequence, 2)
+
+        with self.assertRaisesRegex(CasHold, "cas_journal_mode_scope_invalid"):
+            self.authority.record_issuance(
+                permit_id="TEST:permit-2", candidate_digest="f" * 64,
+                permit_digest="1" * 64, worker_run_id="TEST:run-2",
+            )
+        with self.assertRaisesRegex(CasHold, "cas_journal_mode_scope_invalid"):
+            test_issuer.record_issuance(
+                permit_id="permit-3", candidate_digest="f" * 64,
+                permit_digest="1" * 64, worker_run_id="run-3",
+            )
+        with self.assertRaises(ValueError):
+            PermitCasJournal(self.backend, repository_id=1234, mode="test")
+
+    def test_https_backend_preserves_the_exact_test_key_route(self) -> None:
+        backend = HttpsCasBackend(
+            endpoint="https://cas.example.invalid/functions/v1/sake-cas-v1",
+            bearer_token="test-only",
+        )
+        self.assertEqual(
+            backend._url("repositories/1458303357/b09-permit-journal-test-v1.json"),
+            "https://cas.example.invalid/functions/v1/sake-cas-v1/"
+            "repositories/1458303357/b09-permit-journal-test-v1.json",
+        )
+
     def test_http_backend_uses_conditional_https_put_without_network(self) -> None:
         class Response:
             headers = {"ETag": '"etag-1"'}

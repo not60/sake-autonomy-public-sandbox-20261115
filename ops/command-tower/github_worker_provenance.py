@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 REPOSITORY = "not60/sake-autonomy-public-sandbox-20261115"
 REPOSITORY_ID = 1458303357
 WORKFLOW_PATH = ".github/workflows/public-runner-draft.yml"
+TRUSTED_BRANCH = "trusted/f4-nonprod-20261119"
 ARTIFACT_NAME = "b09-public-runner-candidate"
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -25,6 +26,8 @@ def verify_worker_artifact_provenance(
     *,
     expected_run_id: str,
     expected_base_sha: str,
+    expected_execution_sha: str,
+    expected_cycle: int,
     bearer_token: str,
     opener: Callable[..., object] = urlopen,
     timeout: float = 5.0,
@@ -39,6 +42,8 @@ def verify_worker_artifact_provenance(
             or manifest.get("repository_id") != REPOSITORY_ID
             or manifest.get("base_sha") != expected_base_sha
             or not isinstance(expected_base_sha, str) or not _GIT_SHA.fullmatch(expected_base_sha)
+            or not isinstance(expected_execution_sha, str) or not _GIT_SHA.fullmatch(expected_execution_sha)
+            or isinstance(expected_cycle, bool) or expected_cycle not in (1, 2)
             or not isinstance(expected_run_id, str) or not expected_run_id.isdigit()
             or not isinstance(bearer_token, str) or not bearer_token
             or timeout <= 0):
@@ -47,10 +52,10 @@ def verify_worker_artifact_provenance(
     worker_run_id = manifest.get("worker_run_id")
     if not isinstance(worker_run_id, str) or not worker_run_id.startswith(prefix):
         raise WorkerProvenanceHold("worker_run_id_mismatch")
-    attempt_text = worker_run_id[len(prefix):]
-    if not attempt_text.isdigit() or int(attempt_text) < 1:
-        raise WorkerProvenanceHold("worker_attempt_invalid")
-    attempt = int(attempt_text)
+    identity = re.fullmatch(r"([1-9][0-9]*)-cycle-([12])", worker_run_id[len(prefix):])
+    if identity is None or int(identity.group(2)) != expected_cycle:
+        raise WorkerProvenanceHold("worker_attempt_or_cycle_invalid")
+    attempt = int(identity.group(1))
 
     run = _get_json(
         f"/repos/{REPOSITORY}/actions/runs/{expected_run_id}",
@@ -67,8 +72,8 @@ def verify_worker_artifact_provenance(
             or run.get("run_attempt") != attempt
             or run.get("path") != WORKFLOW_PATH
             or run.get("event") != "workflow_dispatch"
-            or run.get("head_branch") != "main"
-            or run.get("head_sha") != expected_base_sha
+            or run.get("head_branch") != TRUSTED_BRANCH
+            or run.get("head_sha") != expected_execution_sha
             or run.get("status") != "completed"
             or run.get("conclusion") != "success"
             or not isinstance(artifacts, Mapping)
@@ -83,8 +88,8 @@ def verify_worker_artifact_provenance(
     if (not isinstance(linked_run, Mapping)
             or linked_run.get("id") != int(expected_run_id)
             or linked_run.get("repository_id") != REPOSITORY_ID
-            or linked_run.get("head_branch") != "main"
-            or linked_run.get("head_sha") != expected_base_sha
+            or linked_run.get("head_branch") != TRUSTED_BRANCH
+            or linked_run.get("head_sha") != expected_execution_sha
             or artifact.get("expired") is not False
             or isinstance(artifact.get("id"), bool)
             or not isinstance(artifact.get("id"), int)
@@ -97,7 +102,7 @@ def verify_worker_artifact_provenance(
         "workflow_run_id": expected_run_id,
         "run_attempt": attempt,
         "workflow_path": WORKFLOW_PATH,
-        "source_commit_sha": expected_base_sha,
+        "source_commit_sha": expected_execution_sha,
         "artifact_name": ARTIFACT_NAME,
         "artifact_id": artifact["id"],
         "archive_digest": artifact["digest"],

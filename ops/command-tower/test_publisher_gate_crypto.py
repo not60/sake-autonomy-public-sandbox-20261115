@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +17,12 @@ from publisher_gate import (
     PublisherGate, PublisherGateHold, TrustedVerificationKey,
     is_gate_approved_draft_pr_plan, prepare_draft_pr_plan,
 )
+from f4_limited_delegation import (
+    DelegationHold, build_delegation_payload,
+    issue_candidate_authorization_for_role, combine_candidate_authorization_fragments,
+    verify_delegation_contract,
+)
+from f4_auditor_artifact import verify_limited_delegation as verify_auditor_delegation
 from test_cas_journal import MemoryCasBackend
 
 
@@ -24,6 +32,7 @@ PATH = "ops/command-tower/candidate.py"
 CONTENT = b"test-only signed candidate\n"
 CODEX_OUTPUT = b"test-only Codex result\n"
 WORKER_RUN_ID = "test-run-42"
+F4_NOW = datetime(2026, 11, 19, 3, 0, tzinfo=timezone.utc)
 
 
 def public_bytes(private_key: Ed25519PrivateKey) -> bytes:
@@ -173,6 +182,128 @@ class PublisherGateCryptoTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PublisherGateHold, "witness_journal_parent_mismatch"):
             self.verify(gate=self._gate(self._new_store("stale.sqlite3")))
+
+    def test_owner_and_delegate_ed25519_signatures_are_reverified_by_publisher_and_auditor(self) -> None:
+        case = self._delegation_case()
+        kwargs = self._delegation_verifier_kwargs(case)
+        publisher_digest = PublisherGate.verify_limited_delegation(**kwargs)
+        auditor_digest = verify_auditor_delegation(**kwargs)
+        self.assertEqual(publisher_digest, auditor_digest)
+        self.assertEqual(len(publisher_digest), 64)
+
+    def test_delegation_rejects_missing_owner_signature_tamper_revocation_and_protected_path(self) -> None:
+        case = self._delegation_case()
+        contract, _status, _evidence, authorization, _candidate_verifier = case
+        kwargs = self._delegation_verifier_kwargs(case)
+
+        missing_owner = {**contract, "approvals": {"owner_a": contract["approvals"]["owner_a"]}}
+        with self.assertRaisesRegex(DelegationHold, "both_owner_signatures_required"):
+            PublisherGate.verify_limited_delegation(**{**kwargs, "delegation_envelope": missing_owner})
+
+        tampered = {**authorization, "signatures": dict(authorization["signatures"])}
+        tampered["signatures"]["owner_b_delegate"] = {
+            **tampered["signatures"]["owner_b_delegate"],
+            "signature": base64.b64encode(b"x" * 64).decode("ascii"),
+        }
+        with self.assertRaisesRegex(DelegationHold, "signature_invalid"):
+            verify_auditor_delegation(**{**kwargs, "authorization": tampered})
+
+        with self.assertRaisesRegex(DelegationHold, "revocation_not_authenticated"):
+            PublisherGate.verify_limited_delegation(
+                **{**kwargs, "verify_revocation_status": lambda _status, _payload: False},
+            )
+
+        with self.assertRaisesRegex(ValueError, "unsafe_or_noncanonical"):
+            build_delegation_payload(
+                delegation_id="fixture-delegation-protected",
+                execution_revision=BASE_SHA, task_id="fixture-f4-task",
+                allowed_paths=("ops/command-tower/f4_go_gate.py",),
+                not_before="2026-11-19T02:00:00Z", expires_at="2026-11-19T04:00:00Z",
+                revocation_sequence=1, delegates={},
+            )
+
+    def _delegation_case(self):
+        """Build an ephemeral, real-Ed25519 test delegation and candidate."""
+        verified_bundle = self.verify()
+        delegate_keys = {
+            "owner_a_delegate": Ed25519PrivateKey.generate(),
+            "owner_b_delegate": Ed25519PrivateKey.generate(),
+        }
+        delegates = {
+            role: {"key_id": role + "-fixture",
+                   "public_key": base64.b64encode(public_bytes(key)).decode("ascii")}
+            for role, key in delegate_keys.items()
+        }
+        payload = build_delegation_payload(
+            delegation_id="fixture-limited-delegation-1", execution_revision=BASE_SHA,
+            task_id="fixture-f4-task", allowed_paths=(PATH,),
+            not_before="2026-11-19T02:00:00Z", expires_at="2026-11-19T04:00:00Z",
+            revocation_sequence=1, delegates=delegates,
+        )
+        contract = {
+            "schema": 1, "state": "SIGNED_DELEGATION", "payload": payload,
+            "approvals": {
+                role: sign_envelope(key_id=role + "-key", private_key=self.keys[role], payload=payload)
+                for role in ("owner_a", "owner_b")
+            },
+        }
+        status = {"delegation_id": "fixture-limited-delegation-1", "sequence": 1, "status": "ACTIVE"}
+        verify_revocation = lambda observed, scope: (
+            observed == status and scope["delegation_id"] == status["delegation_id"]
+        )
+        verified_delegation = verify_delegation_contract(
+            envelope=contract, trusted_owner_keys=self.trusted_keys,
+            expected_execution_revision=BASE_SHA, expected_task_id="fixture-f4-task",
+            revocation_status=status, verify_revocation_status=verify_revocation,
+            now=F4_NOW,
+        )
+        snapshot = self.journal.snapshot()
+        provenance_digest = hashlib.sha256(b"fixture worker provenance receipt").hexdigest()
+        evidence = {
+            "repository_id": REPOSITORY_ID, "execution_revision": BASE_SHA,
+            "task_id": "fixture-f4-task", "cycle_number": 1,
+            "run_id": WORKER_RUN_ID, "changed_paths": [PATH],
+            "file_sha256": dict(verified_bundle.file_sha256),
+            "candidate_digest": verified_bundle.candidate_digest,
+            "permit_digest": verified_bundle.permit_digest,
+            "witness_digest": verified_bundle.witness_digest,
+            "cas_revision": snapshot.sequence, "cas_head_sha256": snapshot.head_sha256,
+            "worker_provenance_digest": provenance_digest, "cycle1_audit_digest": None,
+            "issued_at": "2026-11-19T02:30:00Z", "expires_at": "2026-11-19T03:30:00Z",
+        }
+
+        def verify_candidate(observed, _delegation):
+            current = self.journal.snapshot()
+            return (observed == evidence
+                    and verified_bundle.candidate_digest == self.manifest["candidate_digest"]
+                    and current.sequence == snapshot.sequence
+                    and current.head_sha256 == snapshot.head_sha256
+                    and provenance_digest == observed["worker_provenance_digest"])
+
+        fragments = [
+            issue_candidate_authorization_for_role(
+                delegation=verified_delegation, role=role, evidence=evidence,
+                verify_candidate_evidence=verify_candidate, signer=key, now=F4_NOW,
+            )
+            for role, key in delegate_keys.items()
+        ]
+        authorization = combine_candidate_authorization_fragments(
+            delegation=verified_delegation, fragments=fragments,
+        )
+        return contract, status, evidence, authorization, verify_candidate
+
+    def _delegation_verifier_kwargs(self, case):
+        contract, status, evidence, authorization, evidence_verifier = case
+        verify_revocation = lambda observed, scope: (
+            observed == status and scope["delegation_id"] == status["delegation_id"]
+        )
+        return {
+            "delegation_envelope": contract, "trusted_owner_keys": self.trusted_keys,
+            "expected_execution_revision": BASE_SHA, "expected_task_id": "fixture-f4-task",
+            "revocation_status": status, "verify_revocation_status": verify_revocation,
+            "authorization": authorization, "evidence": evidence,
+            "verify_candidate_evidence": evidence_verifier, "now": F4_NOW,
+        }
 
     def _new_store(self, filename: str) -> DurableStore:
         return DurableStore(Path(self.temporary.name) / filename)

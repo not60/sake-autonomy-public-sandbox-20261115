@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "ops/command-tower"))
 
 from github_worker_provenance import (  # noqa: E402
-    ARTIFACT_NAME, REPOSITORY_ID, WORKFLOW_PATH, WorkerProvenanceHold,
+    ARTIFACT_NAME, REPOSITORY_ID, TRUSTED_BRANCH, WORKFLOW_PATH, WorkerProvenanceHold,
     verify_worker_artifact_provenance,
 )
 
@@ -33,14 +33,14 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
     def setUp(self):
         self.manifest = {
             "schema": 2, "repository_id": REPOSITORY_ID, "base_sha": BASE,
-            "worker_run_id": "12345-2", "codex_output_sha256": hashlib.sha256(b"out").hexdigest(),
+            "worker_run_id": "12345-2-cycle-1", "codex_output_sha256": hashlib.sha256(b"out").hexdigest(),
             "changed_paths": ["ops/command-tower/example.py"],
             "files": {"ops/command-tower/example.py": hashlib.sha256(b"file").hexdigest()},
             "candidate_digest": hashlib.sha256(b"candidate").hexdigest(),
         }
         self.run = {
             "id": 12345, "run_attempt": 2, "path": WORKFLOW_PATH,
-            "event": "workflow_dispatch", "head_branch": "main", "head_sha": BASE,
+            "event": "workflow_dispatch", "head_branch": TRUSTED_BRANCH, "head_sha": BASE,
             "status": "completed", "conclusion": "success",
             "repository": {"id": REPOSITORY_ID},
         }
@@ -49,7 +49,7 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
             "digest": "sha256:" + "b" * 64,
             "workflow_run": {
                 "id": 12345, "repository_id": REPOSITORY_ID,
-                "head_branch": "main", "head_sha": BASE,
+                "head_branch": TRUSTED_BRANCH, "head_sha": BASE,
             },
         }]}
 
@@ -57,6 +57,8 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
         opener = Mock(side_effect=[response(self.run), response(self.artifacts)])
         result = verify_worker_artifact_provenance(
             self.manifest, expected_run_id="12345", expected_base_sha=BASE,
+            expected_execution_sha=BASE,
+            expected_cycle=1,
             bearer_token="test-only", opener=opener,
         )
         self.assertEqual(result["run_attempt"], 2)
@@ -70,6 +72,8 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerProvenanceHold, "not_completed_successfully"):
             verify_worker_artifact_provenance(
                 self.manifest, expected_run_id="12345", expected_base_sha=BASE,
+                expected_execution_sha=BASE,
+                expected_cycle=1,
                 bearer_token="test-only", opener=opener,
             )
 
@@ -77,6 +81,7 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
         for changed_run in (
             {**self.run, "run_attempt": 1},
             {**self.run, "head_sha": "c" * 40},
+            {**self.run, "head_branch": "main"},
             {**self.run, "repository": {"id": REPOSITORY_ID + 1}},
         ):
             with self.subTest(changed_run=changed_run):
@@ -84,6 +89,8 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
                 with self.assertRaises(WorkerProvenanceHold):
                     verify_worker_artifact_provenance(
                         self.manifest, expected_run_id="12345", expected_base_sha=BASE,
+                        expected_execution_sha=BASE,
+                        expected_cycle=1,
                         bearer_token="test-only", opener=opener,
                     )
 
@@ -92,6 +99,8 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerProvenanceHold, "artifact_metadata_invalid"):
             verify_worker_artifact_provenance(
                 self.manifest, expected_run_id="12345", expected_base_sha=BASE,
+                expected_execution_sha=BASE,
+                expected_cycle=1,
                 bearer_token="test-only", opener=opener,
             )
 
@@ -99,6 +108,8 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerProvenanceHold, "worker_run_id_mismatch"):
             verify_worker_artifact_provenance(
                 self.manifest, expected_run_id="99999", expected_base_sha=BASE,
+                expected_execution_sha=BASE,
+                expected_cycle=1,
                 bearer_token="test-only", opener=Mock(),
             )
         no_artifact = {"artifacts": []}
@@ -106,6 +117,8 @@ class WorkerArtifactProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerProvenanceHold, "artifact_missing_or_duplicated"):
             verify_worker_artifact_provenance(
                 self.manifest, expected_run_id="12345", expected_base_sha=BASE,
+                expected_execution_sha=BASE,
+                expected_cycle=1,
                 bearer_token="test-only", opener=opener,
             )
 

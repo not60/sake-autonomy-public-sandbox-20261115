@@ -15,6 +15,24 @@ from f4_cycle_control import (
 )
 from f4_go_gate import F4GoHold, verify_f4_go_candidate, verified_f4_go_sha256
 from trusted_key_registry import TrustedVerificationKey, load_trusted_verification_keys
+from f4_limited_delegation import verify_auditor_candidate_authorization
+
+
+def verify_limited_delegation(*, delegation_envelope, trusted_owner_keys,
+                              expected_execution_revision, expected_task_id,
+                              revocation_status, verify_revocation_status,
+                              authorization, evidence, verify_candidate_evidence,
+                              now=None) -> str:
+    """Auditor-side entry point; caller supplies an independent read-only verifier."""
+    return verify_auditor_candidate_authorization(
+        delegation_envelope=delegation_envelope,
+        trusted_owner_keys=trusted_owner_keys,
+        expected_execution_revision=expected_execution_revision,
+        expected_task_id=expected_task_id, revocation_status=revocation_status,
+        verify_revocation_status=verify_revocation_status,
+        authorization=authorization, evidence=evidence,
+        verify_candidate_evidence=verify_candidate_evidence, now=now,
+    )
 
 
 def _read_json(path: str | Path) -> object:

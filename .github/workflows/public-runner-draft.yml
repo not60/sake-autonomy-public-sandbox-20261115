@@ -41,7 +41,8 @@ permissions: {}
 jobs:
   worker:
     # Hard stop: this local candidate cannot start Codex or a Worker.
-    if: ${{ false && github.ref == 'refs/heads/main' && inputs.execution_stage == 'worker' }}
+    if: ${{ false && github.ref == 'refs/heads/trusted/f4-nonprod-20261119' && inputs.execution_stage == 'worker' }}
+    environment: f4-worker
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -138,7 +139,7 @@ jobs:
             --revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
             --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
             --auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
-            --cycle "$F4_CYCLE" --run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --cycle "$F4_CYCLE" --run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-cycle-$F4_CYCLE" \
             --source-commit-sha "$GITHUB_SHA")
           if [[ "$F4_CYCLE" == '2' ]]; then
             args+=(--operation claim-cycle2 \
@@ -170,6 +171,9 @@ jobs:
             backlog. If it is unsigned or not SIGNED_GO, stop without editing
             files. Do not call GitHub APIs or perform publication.
       - name: Package exact candidate bytes and hash manifest
+        env:
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
         run: |
           set -euo pipefail
           allowed_paths=(
@@ -199,8 +203,8 @@ jobs:
             --worktree-root "$GITHUB_WORKSPACE" \
             --output-root "$RUNNER_TEMP/b09-bundle" \
             --repository-id 1458303357 \
-            --base-sha "$GITHUB_SHA" \
-            --worker-run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --base-sha "$F4_BASE_SHA" \
+            --worker-run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-cycle-$F4_CYCLE" \
             --codex-output-file "$RUNNER_TEMP/codex-final-message.txt" \
             "${args[@]}"
       - name: Transfer the untrusted candidate bundle
@@ -217,7 +221,8 @@ jobs:
       pr_head_sha: ${{ steps.publish.outputs.pr_head_sha }}
       pr_base_sha: ${{ steps.publish.outputs.pr_base_sha }}
     # Hard stop. This role is only a permission candidate; it has no write step.
-    if: ${{ false && github.ref == 'refs/heads/main' && inputs.execution_stage == 'publish-audit' }}
+    if: ${{ false && github.ref == 'refs/heads/trusted/f4-nonprod-20261119' && inputs.execution_stage == 'publish-audit' }}
+    environment: f4-publisher
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -286,7 +291,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           WORKER_RUN_ID: ${{ inputs.worker_run_id }}
-          EXPECTED_BASE_SHA: ${{ github.sha }}
+          EXPECTED_BASE_SHA: ${{ inputs.f4_base_sha }}
+          EXPECTED_EXECUTION_SHA: ${{ github.sha }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -298,19 +305,23 @@ jobs:
           verify_worker_artifact_provenance(
               manifest, expected_run_id=os.environ["WORKER_RUN_ID"],
               expected_base_sha=os.environ["EXPECTED_BASE_SHA"],
+              expected_execution_sha=os.environ["EXPECTED_EXECUTION_SHA"],
+              expected_cycle=int(os.environ["F4_CYCLE"]),
               bearer_token=os.environ.get("GITHUB_TOKEN", ""),
           )
           PY
       - name: Verify exact bytes, Permit, Witness, and durable single use
         id: publish
         env:
+          PUBLISHER_ATTESTATION_RUN_ID: ${{ inputs.publisher_attestation_run_id }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
           B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
           B09_CAS_TOKEN: ${{ secrets.B09_CAS_TOKEN }}
           B09_PUBLISHER_GITHUB_TOKEN: ${{ secrets.B09_PUBLISHER_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          [[ "${{ inputs.publisher_attestation_run_id }}" =~ ^[0-9]+$ ]] || { echo 'HOLD: independent signed Publisher bundle run ID missing.' >&2; exit 78; }
+          [[ "${PUBLISHER_ATTESTATION_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: independent signed Publisher bundle run ID missing.' >&2; exit 78; }
           for item in permit.json witness.json owner-approvals.json; do
             test -s "$RUNNER_TEMP/b09-signed-attestations/$item" || { echo 'HOLD: independent signed Publisher bundle incomplete.' >&2; exit 78; }
           done
@@ -348,7 +359,7 @@ jobs:
             --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
             --database "$RUNNER_TEMP/publisher-journal.sqlite3" \
             --repository-id 1458303357 \
-            --base-sha "$GITHUB_SHA" \
+            --base-sha "$F4_BASE_SHA" \
             --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
             --role publisher \
             --draft-pr-write \
@@ -366,7 +377,8 @@ jobs:
   auditor:
     needs: [publisher]
     # Hard stop. Independent verification is wired but not started in DRAFT_HOLD.
-    if: ${{ false && github.ref == 'refs/heads/main' && inputs.execution_stage == 'publish-audit' }}
+    if: ${{ false && github.ref == 'refs/heads/trusted/f4-nonprod-20261119' && inputs.execution_stage == 'publish-audit' }}
+    environment: f4-auditor
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -442,7 +454,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           WORKER_RUN_ID: ${{ inputs.worker_run_id }}
-          EXPECTED_BASE_SHA: ${{ github.sha }}
+          EXPECTED_BASE_SHA: ${{ inputs.f4_base_sha }}
+          EXPECTED_EXECUTION_SHA: ${{ github.sha }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -454,6 +468,8 @@ jobs:
           verify_worker_artifact_provenance(
               manifest, expected_run_id=os.environ["WORKER_RUN_ID"],
               expected_base_sha=os.environ["EXPECTED_BASE_SHA"],
+              expected_execution_sha=os.environ["EXPECTED_EXECUTION_SHA"],
+              expected_cycle=int(os.environ["F4_CYCLE"]),
               bearer_token=os.environ.get("GITHUB_TOKEN", ""),
           )
           PY
@@ -462,6 +478,7 @@ jobs:
           B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
           B09_CAS_READ_TOKEN: ${{ secrets.B09_CAS_READ_TOKEN }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
           GITHUB_TOKEN: ${{ github.token }}
           B09_PR_NUMBER: ${{ needs.publisher.outputs.pr_number }}
           B09_PR_HEAD_SHA: ${{ needs.publisher.outputs.pr_head_sha }}
@@ -502,7 +519,7 @@ jobs:
             --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
             --database "$RUNNER_TEMP/auditor-journal.sqlite3" \
             --repository-id 1458303357 \
-            --base-sha "$GITHUB_SHA" \
+            --base-sha "$F4_BASE_SHA" \
             --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
             --role auditor \
             --audit-pr-ci \
@@ -565,7 +582,9 @@ jobs:
             --auditor-artifact "$RUNNER_TEMP/b09-f4-cycle1-auditor-evidence/auditor-envelope.json"
       - name: End Cycle 2 in SAFE STOP
         if: ${{ inputs.f4_cycle == '2' }}
+        env:
+          F4_CYCLE: ${{ inputs.f4_cycle }}
         run: |
           set -euo pipefail
-          test "${{ inputs.f4_cycle }}" = '2'
+          test "$F4_CYCLE" = '2'
           echo 'F4_CYCLE2_AUDITOR_COMPLETE_SAFE_STOP'

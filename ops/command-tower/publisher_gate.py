@@ -21,6 +21,7 @@ from durable_store import (
     PermitIdAlreadyIssued,
 )
 from trusted_key_registry import TrustedVerificationKey, load_trusted_verification_keys
+from f4_limited_delegation import verify_publisher_candidate_authorization
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -105,6 +106,29 @@ def is_gate_approved_draft_pr_plan(plan: DraftPrPlan) -> bool:
 
 class PublisherGate:
     """Verify Worker output, separate role signatures, CAS continuity, and local consumption."""
+
+    @staticmethod
+    def verify_limited_delegation(*, delegation_envelope, trusted_owner_keys,
+                                  expected_execution_revision, expected_task_id,
+                                  revocation_status, verify_revocation_status,
+                                  authorization, evidence, verify_candidate_evidence,
+                                  now=None) -> str:
+        """Publisher-side entry point for a fully scoped delegated authorization.
+
+        The existing direct Owner A/B approval path remains unchanged. A caller
+        using delegation must provide a fresh Publisher-owned Permit/Witness/CAS
+        and Worker provenance verifier; the delegation envelope alone is not
+        evidence that those checks passed.
+        """
+        return verify_publisher_candidate_authorization(
+            delegation_envelope=delegation_envelope,
+            trusted_owner_keys=trusted_owner_keys,
+            expected_execution_revision=expected_execution_revision,
+            expected_task_id=expected_task_id, revocation_status=revocation_status,
+            verify_revocation_status=verify_revocation_status,
+            authorization=authorization, evidence=evidence,
+            verify_candidate_evidence=verify_candidate_evidence, now=now,
+        )
 
     def __init__(self, *, repository_id: int, base_sha: str,
                  allowed_paths: tuple[str, ...],

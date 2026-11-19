@@ -9,24 +9,24 @@ import {
 } from "../supabase/functions/sake-cas-v1/core.ts";
 
 const tokens = {
-  B09_CAS_ISSUER_BEARER: "fixture-issuer-token-0123456789-abcdef",
-  B09_CAS_WITNESS_BEARER: "fixture-witness-token-0123456789-abcde",
-  B09_CAS_TOKEN: "fixture-publisher-token-0123456789-abcd",
-  B09_CAS_READ_TOKEN: "fixture-auditor-token-0123456789-abcdefg",
-  B09_CAS_TEST_ISSUER_BEARER: "fixture-test-issuer-token-0123456789-abcdef",
-  B09_CAS_TEST_WITNESS_BEARER: "fixture-test-witness-token-0123456789-abcde",
-  B09_CAS_TEST_PUBLISHER_BEARER: "fixture-test-publisher-token-0123456789-abcd",
-  B09_CAS_TEST_AUDITOR_BEARER: "fixture-test-auditor-token-0123456789-abcdefg",
+  B09_CAS_V2_ISSUER_BEARER: "fixture-v2-issuer-token-0123456789-abcdef",
+  B09_CAS_V2_WITNESS_BEARER: "fixture-v2-witness-token-0123456789-abcde",
+  B09_CAS_V2_PUBLISHER_BEARER: "fixture-v2-publisher-token-0123456789-abcd",
+  B09_CAS_V2_AUDITOR_BEARER: "fixture-v2-auditor-token-0123456789-abcdefg",
+  B09_CAS_V2_TEST_ISSUER_BEARER: "fixture-v2-test-issuer-token-0123456789-abcdef",
+  B09_CAS_V2_TEST_WITNESS_BEARER: "fixture-v2-test-witness-token-0123456789-abcde",
+  B09_CAS_V2_TEST_PUBLISHER_BEARER: "fixture-v2-test-publisher-token-0123456789-abcd",
+  B09_CAS_V2_TEST_AUDITOR_BEARER: "fixture-v2-test-auditor-token-0123456789-abcdefg",
 };
 const roleTokens = {
-  issuer: "B09_CAS_ISSUER_BEARER",
-  witness: "B09_CAS_WITNESS_BEARER",
-  publisher: "B09_CAS_TOKEN",
-  auditor: "B09_CAS_READ_TOKEN",
-  testIssuer: "B09_CAS_TEST_ISSUER_BEARER",
-  testWitness: "B09_CAS_TEST_WITNESS_BEARER",
-  testPublisher: "B09_CAS_TEST_PUBLISHER_BEARER",
-  testAuditor: "B09_CAS_TEST_AUDITOR_BEARER",
+  issuer: "B09_CAS_V2_ISSUER_BEARER",
+  witness: "B09_CAS_V2_WITNESS_BEARER",
+  publisher: "B09_CAS_V2_PUBLISHER_BEARER",
+  auditor: "B09_CAS_V2_AUDITOR_BEARER",
+  testIssuer: "B09_CAS_V2_TEST_ISSUER_BEARER",
+  testWitness: "B09_CAS_V2_TEST_WITNESS_BEARER",
+  testPublisher: "B09_CAS_V2_TEST_PUBLISHER_BEARER",
+  testAuditor: "B09_CAS_V2_TEST_AUDITOR_BEARER",
 };
 
 class FixtureStore {
@@ -90,15 +90,17 @@ class ScopedFixtureStore {
 }
 
 function deps(store, overrides = {}) {
-  const values = { ...tokens, ...overrides };
+  const values = { B09_CAS_AUTH_GENERATION: "v2", ...tokens, ...overrides };
   return { env: { get: (name) => values[name] }, store };
 }
 
 function request(method, role, options = {}) {
-  const { body, headers = {}, path = "/functions/v1/sake-cas-v1/" + CAS_KEY } = options;
+  const { body, headers = {}, path = "/functions/v1/sake-cas-v1/" + CAS_KEY,
+    authGeneration = "v2" } = options;
   const token = role ? tokens[roleTokens[role]] : null;
   const requestHeaders = new Headers(headers);
   if (token) requestHeaders.set("authorization", "Bearer " + token);
+  if (authGeneration !== null) requestHeaders.set("x-b09-cas-auth-generation", authGeneration);
   return new Request("https://fixture.invalid" + path, {
     method,
     headers: requestHeaders,
@@ -180,10 +182,28 @@ test("role credentials are distinct; missing and rejected credentials fail close
   const store = new FixtureStore();
   assert.equal((await handleCasRequest(request("GET", null), deps(store))).status, 401);
   assert.equal((await handleCasRequest(request("GET", "auditor"), deps(store, {
-    B09_CAS_READ_TOKEN: tokens.B09_CAS_WITNESS_BEARER,
+    B09_CAS_V2_AUDITOR_BEARER: tokens.B09_CAS_V2_WITNESS_BEARER,
   }))).status, 503);
   assert.equal((await handleCasRequest(request("GET", "auditor"), deps(store, {
-    B09_CAS_READ_TOKEN: "",
+    B09_CAS_V2_AUDITOR_BEARER: "",
+  }))).status, 503);
+  assert.equal(store.reads, 0);
+});
+
+test("legacy Bearer-only and wrong auth generations are rejected before DB access", async () => {
+  const store = new FixtureStore();
+  assert.equal((await handleCasRequest(request("GET", null, {
+    headers: { authorization: "Bearer retired-permit-test-fixture" },
+    authGeneration: null,
+  }), deps(store))).status, 401);
+  assert.equal((await handleCasRequest(request("GET", null, {
+    headers: { authorization: "Bearer retired-permit-test-fixture" },
+  }), deps(store))).status, 401);
+  assert.equal((await handleCasRequest(request("GET", "testAuditor", {
+    authGeneration: "v1",
+  }), deps(store))).status, 401);
+  assert.equal((await handleCasRequest(request("GET", "auditor"), deps(store, {
+    B09_CAS_AUTH_GENERATION: "v1",
   }))).status, 503);
   assert.equal(store.reads, 0);
 });
@@ -313,14 +333,16 @@ test("Edge candidate matches existing CAS caller secret names and does not use s
   const core = await readFile(new URL("../supabase/functions/sake-cas-v1/core.ts", import.meta.url), "utf8");
   const index = await readFile(new URL("../supabase/functions/sake-cas-v1/index.ts", import.meta.url), "utf8");
   const config = await readFile(new URL("../supabase/config.toml", import.meta.url), "utf8");
-  assert.match(core, /B09_CAS_TOKEN/);
-  assert.match(core, /B09_CAS_READ_TOKEN/);
-  assert.match(core, /B09_CAS_ISSUER_BEARER/);
-  assert.match(core, /B09_CAS_WITNESS_BEARER/);
-  assert.match(core, /B09_CAS_TEST_ISSUER_BEARER/);
-  assert.match(core, /B09_CAS_TEST_WITNESS_BEARER/);
-  assert.match(core, /B09_CAS_TEST_PUBLISHER_BEARER/);
-  assert.match(core, /B09_CAS_TEST_AUDITOR_BEARER/);
+  assert.match(core, /B09_CAS_V2_PUBLISHER_BEARER/);
+  assert.match(core, /B09_CAS_V2_AUDITOR_BEARER/);
+  assert.match(core, /B09_CAS_V2_ISSUER_BEARER/);
+  assert.match(core, /B09_CAS_V2_WITNESS_BEARER/);
+  assert.match(core, /B09_CAS_V2_TEST_ISSUER_BEARER/);
+  assert.match(core, /B09_CAS_V2_TEST_WITNESS_BEARER/);
+  assert.match(core, /B09_CAS_V2_TEST_PUBLISHER_BEARER/);
+  assert.match(core, /B09_CAS_V2_TEST_AUDITOR_BEARER/);
+  assert.match(core, /B09_CAS_AUTH_GENERATION/);
+  assert.doesNotMatch(core, /"B09_CAS_(?:ISSUER_BEARER|WITNESS_BEARER|TOKEN|READ_TOKEN|TEST_)/);
   assert.match(index, /B09_CAS_DB_URL/);
   assert.doesNotMatch(index, /SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY/);
   assert.doesNotMatch(index + core, /console\.(?:log|error|warn)/);

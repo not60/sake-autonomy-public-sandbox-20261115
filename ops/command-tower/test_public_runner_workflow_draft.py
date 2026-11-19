@@ -36,7 +36,7 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         self.assertIn("contents: read", auditor)
         self.assertIn("pull-requests: read", auditor)
         self.assertIn("actions: read", auditor)
-        self.assertIn("B09_CAS_READ_TOKEN: ${{ secrets.B09_CAS_READ_TOKEN }}", auditor)
+        self.assertIn("B09_CAS_V2_AUDITOR_BEARER: ${{ secrets.B09_CAS_V2_AUDITOR_BEARER }}", auditor)
         self.assertNotIn("B09_CAS_TOKEN: ${{ secrets.B09_CAS_TOKEN }}", auditor)
         self.assertNotIn("OPENAI_API_KEY", publisher + auditor)
         codex_step = source.split("      - name: Codex candidate generation\n", 1)[1].split("      - name:", 1)[0]
@@ -106,7 +106,7 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         self.assertIn("pr_head_sha: ${{ steps.publish.outputs.pr_head_sha }}", publisher)
         self.assertIn("result=\"$(python ops/command-tower/publisher_gate.py", publisher)
         self.assertIn("--trusted-keys", publisher)
-        self.assertIn("B09_CAS_TOKEN: ${{ secrets.B09_CAS_TOKEN }}", publisher)
+        self.assertIn("B09_CAS_V2_PUBLISHER_BEARER: ${{ secrets.B09_CAS_V2_PUBLISHER_BEARER }}", publisher)
         auditor = section(source, "auditor", None)
         self.assertIn("GITHUB_TOKEN: ${{ github.token }}", auditor)
         self.assertIn("--audit-pr-ci", auditor)

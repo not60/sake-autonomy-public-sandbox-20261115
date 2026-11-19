@@ -216,7 +216,8 @@ class PublisherGateCryptoTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsafe_or_noncanonical"):
             build_delegation_payload(
                 delegation_id="fixture-delegation-protected",
-                execution_revision=BASE_SHA, task_id="fixture-f4-task",
+                execution_revision=BASE_SHA,
+                cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
                 allowed_paths=("ops/command-tower/f4_go_gate.py",),
                 not_before="2026-11-19T02:00:00Z", expires_at="2026-11-19T04:00:00Z",
                 revocation_sequence=1, delegates={},
@@ -236,7 +237,7 @@ class PublisherGateCryptoTests(unittest.TestCase):
         }
         payload = build_delegation_payload(
             delegation_id="fixture-limited-delegation-1", execution_revision=BASE_SHA,
-            task_id="fixture-f4-task", allowed_paths=(PATH,),
+            cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"), allowed_paths=(PATH,),
             not_before="2026-11-19T02:00:00Z", expires_at="2026-11-19T04:00:00Z",
             revocation_sequence=1, delegates=delegates,
         )
@@ -253,7 +254,8 @@ class PublisherGateCryptoTests(unittest.TestCase):
         )
         verified_delegation = verify_delegation_contract(
             envelope=contract, trusted_owner_keys=self.trusted_keys,
-            expected_execution_revision=BASE_SHA, expected_task_id="fixture-f4-task",
+            expected_execution_revision=BASE_SHA,
+            expected_cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
             revocation_status=status, verify_revocation_status=verify_revocation,
             now=F4_NOW,
         )
@@ -261,7 +263,7 @@ class PublisherGateCryptoTests(unittest.TestCase):
         provenance_digest = hashlib.sha256(b"fixture worker provenance receipt").hexdigest()
         evidence = {
             "repository_id": REPOSITORY_ID, "execution_revision": BASE_SHA,
-            "task_id": "fixture-f4-task", "cycle_number": 1,
+            "task_id": "fixture-f4-task-cycle1", "cycle_number": 1,
             "run_id": WORKER_RUN_ID, "changed_paths": [PATH],
             "file_sha256": dict(verified_bundle.file_sha256),
             "candidate_digest": verified_bundle.candidate_digest,
@@ -299,7 +301,8 @@ class PublisherGateCryptoTests(unittest.TestCase):
         )
         return {
             "delegation_envelope": contract, "trusted_owner_keys": self.trusted_keys,
-            "expected_execution_revision": BASE_SHA, "expected_task_id": "fixture-f4-task",
+            "expected_execution_revision": BASE_SHA,
+            "expected_cycle_tasks": ("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
             "revocation_status": status, "verify_revocation_status": verify_revocation,
             "authorization": authorization, "evidence": evidence,
             "verify_candidate_evidence": evidence_verifier, "now": F4_NOW,

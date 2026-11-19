@@ -3,10 +3,11 @@ import test from "node:test";
 import { F4_CONTROL_KEY, F4_CONTROL_TEST_KEY, handleF4ControlRequest } from "../supabase/functions/sake-cas-v1/cycle_control.ts";
 
 const names = [
-  "B09_F4_CONTROL_OWNER_BEARER", "B09_F4_CONTROL_WORKER_BEARER", "B09_F4_CONTROL_AUDITOR_BEARER", "B09_F4_CONTROL_READ_BEARER",
-  "B09_F4_TEST_CONTROL_OWNER_BEARER", "B09_F4_TEST_CONTROL_WORKER_BEARER", "B09_F4_TEST_CONTROL_AUDITOR_BEARER", "B09_F4_TEST_CONTROL_READ_BEARER",
+  "B09_F4_CONTROL_V2_OWNER_BEARER", "B09_F4_CONTROL_V2_WORKER_BEARER", "B09_F4_CONTROL_V2_AUDITOR_BEARER", "B09_F4_CONTROL_V2_READ_BEARER",
+  "B09_F4_CONTROL_V2_TEST_OWNER_BEARER", "B09_F4_CONTROL_V2_TEST_WORKER_BEARER", "B09_F4_CONTROL_V2_TEST_AUDITOR_BEARER", "B09_F4_CONTROL_V2_TEST_READ_BEARER",
 ];
-const envValues = Object.fromEntries(names.map((name, i) => [name, `fixture-f4-control-role-${i}-long-unique-token` ]));
+const envValues = Object.fromEntries(names.map((name, i) => [name, `fixture-f4-control-v2-role-${i}-long-unique-token` ]));
+envValues.B09_CAS_AUTH_GENERATION = "v2";
 const b64 = (value) => btoa(String.fromCharCode(...new Uint8Array(value)));
 const signingKeys = {};
 for (const role of ["permit_authority", "witness", "owner_a", "owner_b", "auditor"]) {
@@ -24,14 +25,15 @@ envValues.B09_F4_TRUSTED_KEYS_JSON = JSON.stringify(ownerKeyDocument);
 envValues.B09_F4_AUDITOR_KEY_JSON = JSON.stringify(auditorKeyDocument);
 class Store {
   values = new Map();
-  async read(key) { return this.values.get(key); }
+  reads = 0;
+  async read(key) { this.reads++; return this.values.get(key); }
   async insertIfAbsent(key, body) { if (this.values.has(key)) return undefined; this.values.set(key, { revision: 1, body }); return 1; }
   async updateIfRevision(key, revision, body) { const current = this.values.get(key); if (!current || current.revision !== revision) return undefined; this.values.set(key, { revision: revision + 1, body }); return revision + 1; }
 }
 const store = new Store();
 const deps = { env: { get: (name) => envValues[name] }, store };
 const token = (name) => envValues[name];
-const auth = (name) => ({ authorization: `Bearer ${token(name)}` });
+const auth = (name) => ({ authorization: `Bearer ${token(name)}`, "x-b09-cas-auth-generation": "v2" });
 const canonical = (value) => value === null || typeof value !== "object"
   ? JSON.stringify(value)
   : Array.isArray(value) ? `[${value.map(canonical).join(",")}]`
@@ -90,32 +92,52 @@ function auditPayload(document) {
 test("fixed control keys, independent credentials, and role transitions fail closed", async () => {
   assert.equal(F4_CONTROL_KEY, "repositories/1458303357/b09-f4-cycle-control-v1.json");
   assert.equal(F4_CONTROL_TEST_KEY, "repositories/1458303357/b09-f4-cycle-control-test-v1.json");
-  assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_READ_BEARER", "repositories/1458303357/other.json"), deps)).status, 404);
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_OWNER_BEARER", F4_CONTROL_TEST_KEY, { headers: { "content-type": "application/json", "if-none-match": "*" }, body: JSON.stringify(await initialDocument()) }), deps)).status, 403);
+  assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_V2_READ_BEARER", "repositories/1458303357/other.json"), deps)).status, 404);
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_OWNER_BEARER", F4_CONTROL_TEST_KEY, { headers: { "content-type": "application/json", "if-none-match": "*" }, body: JSON.stringify(await initialDocument()) }), deps)).status, 403);
   const created = await initialDocument();
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_OWNER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-none-match": "*" }, body: JSON.stringify(created) }), deps)).status, 204);
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_OWNER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-none-match": "*" }, body: JSON.stringify(created) }), deps)).status, 204);
   const claim = await append(created, { event: "CYCLE_CLAIMED", cycle_number: 1, run_id: "run-1", go_sha256: created.go_sha256, revocation_sequence: 1, revocation_digest: "c".repeat(64), claimed_at: "2026-11-19T00:00:00Z", source_commit_sha: "d".repeat(40) });
   const headers = { "content-type": "application/json", "if-match": '"1"' };
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_AUDITOR_BEARER", F4_CONTROL_KEY, { headers, body: JSON.stringify(claim) }), deps)).status, 403);
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_WORKER_BEARER", F4_CONTROL_KEY, { headers, body: JSON.stringify(claim) }), deps)).status, 204);
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_AUDITOR_BEARER", F4_CONTROL_KEY, { headers, body: JSON.stringify(claim) }), deps)).status, 403);
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_WORKER_BEARER", F4_CONTROL_KEY, { headers, body: JSON.stringify(claim) }), deps)).status, 204);
   const cycle2 = await append(claim, { event: "CYCLE_CLAIMED", cycle_number: 2, run_id: "run-2", go_sha256: created.go_sha256, revocation_sequence: 1, revocation_digest: "c".repeat(64), claimed_at: "2026-11-19T00:00:00Z", source_commit_sha: "e".repeat(40) });
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_WORKER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"2"' }, body: JSON.stringify(cycle2) }), deps)).status, 409);
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_WORKER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"2"' }, body: JSON.stringify(cycle2) }), deps)).status, 409);
   const auditorEnvelope = await sign("auditor", auditPayload(created));
   const audit = await append(claim, { event: "CYCLE1_AUDITOR_PASS", artifact_envelope_sha256: await hash(auditorEnvelope), artifact_id: 17, artifact_archive_digest: "sha256:" + "1".repeat(64), workflow_run_id: "12345", run_attempt: 1, worker_run_id: "run-1", auditor_run_id: "auditor-1", source_commit_sha: "d".repeat(40), auditor_envelope: auditorEnvelope });
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_AUDITOR_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"2"' }, body: JSON.stringify(audit) }), deps)).status, 204);
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_AUDITOR_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"2"' }, body: JSON.stringify(audit) }), deps)).status, 204);
   const cycle2AfterAudit = await append(audit, cycle2.events[2].payload);
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_WORKER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"3"' }, body: JSON.stringify(cycle2AfterAudit) }), deps)).status, 204);
-  const wrongMode = await handleF4ControlRequest(request("GET", "B09_F4_TEST_CONTROL_READ_BEARER", F4_CONTROL_KEY), deps);
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_WORKER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"3"' }, body: JSON.stringify(cycle2AfterAudit) }), deps)).status, 204);
+  const wrongMode = await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_V2_TEST_READ_BEARER", F4_CONTROL_KEY), deps);
   assert.equal(wrongMode.status, 403);
 });
 
 test("duplicate credentials and corrupted journal read fail closed", async () => {
-  const duplicate = { ...envValues, B09_F4_CONTROL_WORKER_BEARER: envValues.B09_F4_CONTROL_OWNER_BEARER };
+  const duplicate = { ...envValues, B09_F4_CONTROL_V2_WORKER_BEARER: envValues.B09_F4_CONTROL_V2_OWNER_BEARER };
   const duplicateDeps = { env: { get: (name) => duplicate[name] }, store };
-  assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_READ_BEARER"), duplicateDeps)).status, 401);
+  assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_V2_READ_BEARER"), duplicateDeps)).status, 401);
   const value = store.values.get(F4_CONTROL_KEY);
   store.values.set(F4_CONTROL_KEY, { ...value, body: value.body.replace("f4-fixture", "tampered") });
-  assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_READ_BEARER"), deps)).status, 503);
+  assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_V2_READ_BEARER"), deps)).status, 503);
+});
+
+test("F4 control rejects legacy Bearer-only requests before DB access", async () => {
+  store.reads = 0;
+  const legacyRequest = new Request(`https://fixture.invalid/functions/v1/sake-cas-v1/${F4_CONTROL_KEY}`, {
+    method: "GET", headers: { authorization: "Bearer retired-permit-test-fixture" },
+  });
+  assert.equal((await handleF4ControlRequest(legacyRequest, deps)).status, 401);
+  const oldBearerWithNewHeader = new Request(`https://fixture.invalid/functions/v1/sake-cas-v1/${F4_CONTROL_KEY}`, {
+    method: "GET", headers: { authorization: "Bearer retired-permit-test-fixture", "x-b09-cas-auth-generation": "v2" },
+  });
+  assert.equal((await handleF4ControlRequest(oldBearerWithNewHeader, deps)).status, 401);
+  const wrongGeneration = request("GET", "B09_F4_CONTROL_V2_READ_BEARER");
+  wrongGeneration.headers.set("x-b09-cas-auth-generation", "v1");
+  assert.equal((await handleF4ControlRequest(wrongGeneration, deps)).status, 401);
+  const configuredGeneration = envValues.B09_CAS_AUTH_GENERATION;
+  envValues.B09_CAS_AUTH_GENERATION = "v1";
+  assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_V2_READ_BEARER"), deps)).status, 503);
+  envValues.B09_CAS_AUTH_GENERATION = configuredGeneration;
+  assert.equal(store.reads, 0);
 });
 
 test("direct HTTP rejects forged Owner signatures even when the journal hash chain is recomputed", async () => {
@@ -124,7 +146,7 @@ test("direct HTTP rejects forged Owner signatures even when the journal hash cha
   const forged = await initialDocument();
   forged.events[0].payload.revocation_status.approvals.owner_a.signature = b64(new Uint8Array(64));
   const rehashed = await rehashDocument(forged);
-  const result = await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_OWNER_BEARER", F4_CONTROL_KEY, {
+  const result = await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_OWNER_BEARER", F4_CONTROL_KEY, {
     headers: { "content-type": "application/json", "if-none-match": "*" }, body: JSON.stringify(rehashed),
   }), isolatedDeps);
   assert.equal(result.status, 409);
@@ -135,17 +157,17 @@ test("direct HTTP rejects a forged independent Auditor signature before Cycle 2 
   const isolatedStore = new Store();
   const isolatedDeps = { env: { get: (name) => envValues[name] }, store: isolatedStore };
   const created = await initialDocument();
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_OWNER_BEARER", F4_CONTROL_KEY, {
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_OWNER_BEARER", F4_CONTROL_KEY, {
     headers: { "content-type": "application/json", "if-none-match": "*" }, body: JSON.stringify(created),
   }), isolatedDeps)).status, 204);
   const claim = await append(created, { event: "CYCLE_CLAIMED", cycle_number: 1, run_id: "run-1", go_sha256: created.go_sha256, revocation_sequence: 1, revocation_digest: "c".repeat(64), claimed_at: new Date().toISOString(), source_commit_sha: "d".repeat(40) });
-  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_WORKER_BEARER", F4_CONTROL_KEY, {
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_WORKER_BEARER", F4_CONTROL_KEY, {
     headers: { "content-type": "application/json", "if-match": '"1"' }, body: JSON.stringify(claim),
   }), isolatedDeps)).status, 204);
   const envelope = await sign("auditor", auditPayload(created));
   envelope.signature = b64(new Uint8Array(64));
   const audit = await append(claim, { event: "CYCLE1_AUDITOR_PASS", artifact_envelope_sha256: await hash(envelope), artifact_id: 17, artifact_archive_digest: "sha256:" + "1".repeat(64), workflow_run_id: "12345", run_attempt: 1, worker_run_id: "run-1", auditor_run_id: "auditor-1", source_commit_sha: "d".repeat(40), auditor_envelope: envelope });
-  const result = await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_AUDITOR_BEARER", F4_CONTROL_KEY, {
+  const result = await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_AUDITOR_BEARER", F4_CONTROL_KEY, {
     headers: { "content-type": "application/json", "if-match": '"2"' }, body: JSON.stringify(audit),
   }), isolatedDeps);
   assert.equal(result.status, 409);

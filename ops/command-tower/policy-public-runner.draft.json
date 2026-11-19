@@ -90,6 +90,7 @@
         },
         "default_github_token_expanded": false,
         "required_scope": "not60/sake-autonomy-public-sandbox-20261115_only",
+        "cas_secret_name": "B09_CAS_V2_PUBLISHER_BEARER",
         "commit_api_candidate": "GraphQL_createCommitOnBranch_expectedHeadOid",
         "commit_retry_policy": "NEVER_RETRY_ON_CONFLICT_API_ERROR_OR_UNKNOWN_RESULT",
         "force_update": false
@@ -124,7 +125,7 @@
         "actions": "read"
       },
       "secrets": [
-        "B09_CAS_READ_TOKEN"
+        "B09_CAS_V2_AUDITOR_BEARER"
       ],
       "write_permissions": [],
       "credential_candidate": {

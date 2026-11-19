@@ -22,10 +22,10 @@ CAS_ENDPOINT = "https://bkpofcpaefkocykvtsjv.supabase.co/functions/v1/sake-cas-v
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _ROLE_TOKEN = {
-    "initialize": "B09_F4_CONTROL_OWNER_BEARER",
-    "claim-cycle1": "B09_F4_CONTROL_WORKER_BEARER",
-    "record-cycle1-audit": "B09_F4_CONTROL_AUDITOR_BEARER",
-    "claim-cycle2": "B09_F4_CONTROL_WORKER_BEARER",
+    "initialize": "B09_F4_CONTROL_V2_OWNER_BEARER",
+    "claim-cycle1": "B09_F4_CONTROL_V2_WORKER_BEARER",
+    "record-cycle1-audit": "B09_F4_CONTROL_V2_AUDITOR_BEARER",
+    "claim-cycle2": "B09_F4_CONTROL_V2_WORKER_BEARER",
 }
 
 

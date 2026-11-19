@@ -1,5 +1,9 @@
 /** DRAFT_HOLD F4 cycle-control CAS route, isolated from Permit journal events. */
-import type { CasDependencies, CasStoredDocument } from "./core.ts";
+import {
+  casAuthGenerationFailure,
+  type CasDependencies,
+  type CasStoredDocument,
+} from "./core.ts";
 
 export const F4_CONTROL_KEY = "repositories/1458303357/b09-f4-cycle-control-v1.json";
 export const F4_CONTROL_TEST_KEY = "repositories/1458303357/b09-f4-cycle-control-test-v1.json";
@@ -28,20 +32,22 @@ const auditPayloadFields = [
 ];
 
 const credentials = [
-  ["B09_F4_CONTROL_OWNER_BEARER", "formal", "owner"],
-  ["B09_F4_CONTROL_WORKER_BEARER", "formal", "worker"],
-  ["B09_F4_CONTROL_AUDITOR_BEARER", "formal", "auditor"],
-  ["B09_F4_CONTROL_READ_BEARER", "formal", "reader"],
-  ["B09_F4_TEST_CONTROL_OWNER_BEARER", "test", "owner"],
-  ["B09_F4_TEST_CONTROL_WORKER_BEARER", "test", "worker"],
-  ["B09_F4_TEST_CONTROL_AUDITOR_BEARER", "test", "auditor"],
-  ["B09_F4_TEST_CONTROL_READ_BEARER", "test", "reader"],
+  ["B09_F4_CONTROL_V2_OWNER_BEARER", "formal", "owner"],
+  ["B09_F4_CONTROL_V2_WORKER_BEARER", "formal", "worker"],
+  ["B09_F4_CONTROL_V2_AUDITOR_BEARER", "formal", "auditor"],
+  ["B09_F4_CONTROL_V2_READ_BEARER", "formal", "reader"],
+  ["B09_F4_CONTROL_V2_TEST_OWNER_BEARER", "test", "owner"],
+  ["B09_F4_CONTROL_V2_TEST_WORKER_BEARER", "test", "worker"],
+  ["B09_F4_CONTROL_V2_TEST_AUDITOR_BEARER", "test", "auditor"],
+  ["B09_F4_CONTROL_V2_TEST_READ_BEARER", "test", "reader"],
 ] as const;
 
 export async function handleF4ControlRequest(
   request: Request,
   dependencies: CasDependencies,
 ): Promise<Response> {
+  const authGenerationFailure = casAuthGenerationFailure(request, dependencies.env);
+  if (authGenerationFailure !== null) return response(authGenerationFailure);
   const principal = identify(request.headers.get("authorization"), dependencies.env);
   if (!principal || !dependencies.store) return response(principal ? 503 : 401);
   const path = new URL(request.url).pathname;

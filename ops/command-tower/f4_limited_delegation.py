@@ -26,7 +26,7 @@ _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CONTRACT_KEYS = {
     "schema", "kind", "delegation_id", "repository_id", "repository",
-    "execution_revision", "task_id", "allowed_paths", "max_cycles",
+    "execution_revision", "cycle_tasks", "allowed_paths", "max_cycles",
     "validity", "revocation", "delegates",
 }
 _ENVELOPE_KEYS = {"key_id", "signature", "payload"}
@@ -72,7 +72,7 @@ class VerifiedDelegation:
     delegation_id: str
     repository_id: int
     execution_revision: str
-    task_id: str
+    cycle_tasks: tuple[str, str]
     allowed_paths: tuple[str, ...]
     max_cycles: int
     not_before: datetime
@@ -91,7 +91,7 @@ class FiniteExecutionResult:
 
 
 def build_delegation_payload(*, delegation_id: str, execution_revision: str,
-                             task_id: str, allowed_paths: tuple[str, ...],
+                             cycle_tasks: tuple[str, str], allowed_paths: tuple[str, ...],
                              not_before: str, expires_at: str,
                              revocation_sequence: int,
                              delegates: Mapping[str, Mapping[str, str]]) -> dict[str, object]:
@@ -100,8 +100,11 @@ def build_delegation_payload(*, delegation_id: str, execution_revision: str,
         raise ValueError("delegation_id_invalid")
     if not isinstance(execution_revision, str) or not _GIT_SHA.fullmatch(execution_revision):
         raise ValueError("execution_revision_invalid")
-    if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
-        raise ValueError("task_id_invalid")
+    if (not isinstance(cycle_tasks, tuple) or len(cycle_tasks) != MAX_CYCLES
+            or any(not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id)
+                   for task_id in cycle_tasks)
+            or len(set(cycle_tasks)) != MAX_CYCLES):
+        raise ValueError("two_distinct_cycle_tasks_required")
     paths = _validate_paths(allowed_paths)
     starts, ends = _parse_utc(not_before), _parse_utc(expires_at)
     if ends <= starts:
@@ -131,10 +134,11 @@ def build_delegation_payload(*, delegation_id: str, execution_revision: str,
             or normalized[_DELEGATE_ROLES[0]]["public_key"] == normalized[_DELEGATE_ROLES[1]]["public_key"]):
         raise ValueError("delegate_keys_not_independent")
     return {
-        "schema": 1, "kind": "F4_LIMITED_DELEGATION",
+        "schema": 2, "kind": "F4_LIMITED_DELEGATION",
         "delegation_id": delegation_id, "repository_id": REPOSITORY_ID,
         "repository": "not60/sake-autonomy-public-sandbox-20261115",
-        "execution_revision": execution_revision, "task_id": task_id,
+        "execution_revision": execution_revision,
+        "cycle_tasks": {str(cycle): task_id for cycle, task_id in enumerate(cycle_tasks, 1)},
         "allowed_paths": list(paths), "max_cycles": MAX_CYCLES,
         "validity": {"not_before": not_before, "expires_at": expires_at},
         "revocation": {"source": "external_cas_signed_status",
@@ -146,7 +150,8 @@ def build_delegation_payload(*, delegation_id: str, execution_revision: str,
 
 def verify_delegation_contract(*, envelope: object,
                                trusted_owner_keys: Mapping[str, TrustedVerificationKey],
-                               expected_execution_revision: str, expected_task_id: str,
+                               expected_execution_revision: str,
+                               expected_cycle_tasks: tuple[str, str],
                                revocation_status: object,
                                verify_revocation_status: Callable[[object, Mapping[str, object]], bool] | None,
                                now: datetime | None = None) -> VerifiedDelegation:
@@ -156,12 +161,22 @@ def verify_delegation_contract(*, envelope: object,
     payload, approvals = envelope["payload"], envelope["approvals"]
     if not isinstance(payload, Mapping) or set(payload) != _CONTRACT_KEYS:
         raise DelegationHold("delegation_payload_invalid")
-    if (payload.get("schema") != 1 or payload.get("kind") != "F4_LIMITED_DELEGATION"
+    if (payload.get("schema") != 2 or payload.get("kind") != "F4_LIMITED_DELEGATION"
             or payload.get("repository_id") != REPOSITORY_ID
             or payload.get("repository") != "not60/sake-autonomy-public-sandbox-20261115"
             or payload.get("execution_revision") != expected_execution_revision
-            or payload.get("task_id") != expected_task_id or payload.get("max_cycles") != MAX_CYCLES):
+            or payload.get("max_cycles") != MAX_CYCLES):
         raise DelegationHold("delegation_scope_mismatch")
+    task_map = payload.get("cycle_tasks")
+    if (not isinstance(expected_cycle_tasks, tuple)
+            or len(expected_cycle_tasks) != MAX_CYCLES
+            or len(set(expected_cycle_tasks)) != MAX_CYCLES
+            or any(not isinstance(task, str) or not _TASK_ID.fullmatch(task)
+                   for task in expected_cycle_tasks)
+            or not isinstance(task_map, Mapping)
+            or set(task_map) != {"1", "2"}
+            or task_map != {str(cycle): task for cycle, task in enumerate(expected_cycle_tasks, 1)}):
+        raise DelegationHold("delegation_cycle_task_scope_mismatch")
     delegation_id = payload.get("delegation_id")
     if not isinstance(delegation_id, str) or not _TASK_ID.fullmatch(delegation_id):
         raise DelegationHold("delegation_id_invalid")
@@ -198,7 +213,8 @@ def verify_delegation_contract(*, envelope: object,
     delegates = _load_delegates(payload.get("delegates"), trusted_owner_keys)
     return VerifiedDelegation(
         delegation_id=delegation_id, repository_id=REPOSITORY_ID,
-        execution_revision=expected_execution_revision, task_id=expected_task_id,
+        execution_revision=expected_execution_revision,
+        cycle_tasks=expected_cycle_tasks,
         allowed_paths=paths, max_cycles=MAX_CYCLES, not_before=starts,
         expires_at=ends, revocation_sequence=revocation["sequence"],
         delegates=delegates, digest=hashlib.sha256(canonical_json(dict(envelope))).hexdigest(),
@@ -348,7 +364,7 @@ def verify_candidate_authorization(*, consumer: str, delegation: VerifiedDelegat
 def verify_publisher_candidate_authorization(*, delegation_envelope: object,
                                              trusted_owner_keys: Mapping[str, TrustedVerificationKey],
                                              expected_execution_revision: str,
-                                             expected_task_id: str,
+                                             expected_cycle_tasks: tuple[str, str],
                                              revocation_status: object,
                                              verify_revocation_status: Callable[[object, Mapping[str, object]], bool] | None,
                                              authorization: object, evidence: object,
@@ -358,7 +374,7 @@ def verify_publisher_candidate_authorization(*, delegation_envelope: object,
     verified = verify_delegation_contract(
         envelope=delegation_envelope, trusted_owner_keys=trusted_owner_keys,
         expected_execution_revision=expected_execution_revision,
-        expected_task_id=expected_task_id, revocation_status=revocation_status,
+        expected_cycle_tasks=expected_cycle_tasks, revocation_status=revocation_status,
         verify_revocation_status=verify_revocation_status, now=now,
     )
     return verify_candidate_authorization(
@@ -370,7 +386,7 @@ def verify_publisher_candidate_authorization(*, delegation_envelope: object,
 def verify_auditor_candidate_authorization(*, delegation_envelope: object,
                                            trusted_owner_keys: Mapping[str, TrustedVerificationKey],
                                            expected_execution_revision: str,
-                                           expected_task_id: str,
+                                           expected_cycle_tasks: tuple[str, str],
                                            revocation_status: object,
                                            verify_revocation_status: Callable[[object, Mapping[str, object]], bool] | None,
                                            authorization: object, evidence: object,
@@ -380,7 +396,7 @@ def verify_auditor_candidate_authorization(*, delegation_envelope: object,
     verified = verify_delegation_contract(
         envelope=delegation_envelope, trusted_owner_keys=trusted_owner_keys,
         expected_execution_revision=expected_execution_revision,
-        expected_task_id=expected_task_id, revocation_status=revocation_status,
+        expected_cycle_tasks=expected_cycle_tasks, revocation_status=revocation_status,
         verify_revocation_status=verify_revocation_status, now=now,
     )
     return verify_candidate_authorization(
@@ -460,13 +476,13 @@ def _validate_evidence(evidence: object, delegation: VerifiedDelegation,
                        now: datetime) -> dict[str, object]:
     if not isinstance(evidence, Mapping) or set(evidence) != _EVIDENCE_FIELDS:
         raise DelegationHold("candidate_evidence_fields_invalid")
-    if (evidence.get("repository_id") != delegation.repository_id
-            or evidence.get("execution_revision") != delegation.execution_revision
-            or evidence.get("task_id") != delegation.task_id):
-        raise DelegationHold("candidate_scope_mismatch")
     cycle = evidence.get("cycle_number")
     if isinstance(cycle, bool) or not isinstance(cycle, int) or cycle not in (1, 2):
         raise DelegationHold("candidate_cycle_outside_delegation")
+    if (evidence.get("repository_id") != delegation.repository_id
+            or evidence.get("execution_revision") != delegation.execution_revision
+            or evidence.get("task_id") != delegation.cycle_tasks[cycle - 1]):
+        raise DelegationHold("candidate_scope_mismatch")
     run_id = evidence.get("run_id")
     if not isinstance(run_id, str) or not _TASK_ID.fullmatch(run_id):
         raise DelegationHold("candidate_run_id_invalid")
@@ -504,7 +520,7 @@ def _validate_evidence(evidence: object, delegation: VerifiedDelegation,
     return {
         "repository_id": delegation.repository_id,
         "execution_revision": delegation.execution_revision,
-        "task_id": delegation.task_id, "cycle_number": cycle, "run_id": run_id,
+        "task_id": delegation.cycle_tasks[cycle - 1], "cycle_number": cycle, "run_id": run_id,
         "changed_paths": list(paths),
         "file_sha256": {path: file_hashes[path] for path in paths},
         "candidate_digest": evidence["candidate_digest"],

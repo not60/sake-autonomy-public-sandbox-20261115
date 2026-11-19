@@ -209,7 +209,7 @@ class F4RuntimeConnectionTests(unittest.TestCase):
                 (folder / name).write_text(json.dumps(value))
             env = {
                 "B09_CAS_ENDPOINT": f4_cycle_runtime.CAS_ENDPOINT,
-                "B09_F4_CONTROL_WORKER_BEARER": "w" * 40,
+                "B09_F4_CONTROL_V2_WORKER_BEARER": "w" * 40,
                 "GITHUB_TOKEN": "g" * 40,
             }
             fake_state = type("State", (), {"sequence": 4})()

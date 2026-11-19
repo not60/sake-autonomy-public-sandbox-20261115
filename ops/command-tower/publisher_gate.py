@@ -109,7 +109,7 @@ class PublisherGate:
 
     @staticmethod
     def verify_limited_delegation(*, delegation_envelope, trusted_owner_keys,
-                                  expected_execution_revision, expected_task_id,
+                                  expected_execution_revision, expected_cycle_tasks,
                                   revocation_status, verify_revocation_status,
                                   authorization, evidence, verify_candidate_evidence,
                                   now=None) -> str:
@@ -124,7 +124,7 @@ class PublisherGate:
             delegation_envelope=delegation_envelope,
             trusted_owner_keys=trusted_owner_keys,
             expected_execution_revision=expected_execution_revision,
-            expected_task_id=expected_task_id, revocation_status=revocation_status,
+            expected_cycle_tasks=expected_cycle_tasks, revocation_status=revocation_status,
             verify_revocation_status=verify_revocation_status,
             authorization=authorization, evidence=evidence,
             verify_candidate_evidence=verify_candidate_evidence, now=now,
@@ -553,7 +553,11 @@ def main(argv: list[str] | None = None) -> int:
             raise PublisherGateHold("expected_head_without_write_request")
         if args.f4_audit_evidence_output and not (args.role == "auditor" and args.audit_pr_ci):
             raise PublisherGateHold("f4_audit_evidence_requires_auditor_ci_pass")
-        token_name = "B09_CAS_TOKEN" if args.role == "publisher" else "B09_CAS_READ_TOKEN"
+        token_name = (
+            "B09_CAS_V2_PUBLISHER_BEARER"
+            if args.role == "publisher"
+            else "B09_CAS_V2_AUDITOR_BEARER"
+        )
         token = os.environ.get(token_name, "")
         if not args.cas_endpoint or not token:
             raise PublisherGateHold("external_cas_credentials_not_configured")

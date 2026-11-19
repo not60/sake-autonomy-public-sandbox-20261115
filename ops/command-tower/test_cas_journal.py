@@ -168,6 +168,7 @@ class PermitCasJournalTests(unittest.TestCase):
         self.assertEqual(request.get_method(), "PUT")
         self.assertEqual(request.get_header("If-none-match"), "*")
         self.assertEqual(request.get_header("Authorization"), "Bearer test-only")
+        self.assertEqual(request.get_header("X-b09-cas-auth-generation"), "v2")
         self.assertEqual(timeout, 5.0)
 
 

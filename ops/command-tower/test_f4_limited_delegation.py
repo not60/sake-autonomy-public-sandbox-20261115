@@ -17,6 +17,8 @@ from trusted_key_registry import TrustedVerificationKey
 NOW = datetime(2026, 11, 19, 3, 0, tzinfo=timezone.utc)
 REVISION = "a" * 40
 TASK = "fixture-task-17"
+TASK_2 = "fixture-task-18"
+TASKS = (TASK, TASK_2)
 
 
 def signature(public_key: bytes, message: bytes) -> bytes:
@@ -56,7 +58,7 @@ class LimitedDelegationTests(unittest.TestCase):
         }
         self.payload = delegation.build_delegation_payload(
             delegation_id="fixture-delegation-1", execution_revision=REVISION,
-            task_id=TASK, allowed_paths=("ops/command-tower/example.py",),
+            cycle_tasks=TASKS, allowed_paths=("ops/command-tower/example.py",),
             not_before="2026-11-19T02:00:00Z", expires_at="2026-11-19T04:00:00Z",
             revocation_sequence=3, delegates=delegate_docs,
         )
@@ -89,7 +91,7 @@ class LimitedDelegationTests(unittest.TestCase):
         return delegation.verify_delegation_contract(
             envelope=self.contract if envelope is None else envelope,
             trusted_owner_keys=self.trusted, expected_execution_revision=REVISION,
-            expected_task_id=TASK,
+            expected_cycle_tasks=TASKS,
             revocation_status=self.status if status is None else status,
             verify_revocation_status=lambda observed, payload: (
                 observed == self.status and payload["delegation_id"] == observed["delegation_id"]
@@ -113,7 +115,7 @@ class LimitedDelegationTests(unittest.TestCase):
     def _entry_args(self, auth, evidence=None, evidence_verifier=lambda _e, _d: True):
         return {
             "delegation_envelope": self.contract, "trusted_owner_keys": self.trusted,
-            "expected_execution_revision": REVISION, "expected_task_id": TASK,
+            "expected_execution_revision": REVISION, "expected_cycle_tasks": TASKS,
             "revocation_status": self.status,
             "verify_revocation_status": lambda observed, payload: (
                 observed == self.status and payload["delegation_id"] == self.status["delegation_id"]
@@ -192,7 +194,7 @@ class LimitedDelegationTests(unittest.TestCase):
         with self.assertRaisesRegex(delegation.DelegationHold, "revocation_not_authenticated"):
             delegation.verify_delegation_contract(
                 envelope=self.contract, trusted_owner_keys=self.trusted,
-                expected_execution_revision=REVISION, expected_task_id=TASK,
+                expected_execution_revision=REVISION, expected_cycle_tasks=TASKS,
                 revocation_status={**self.status, "status": "REVOKED"},
                 verify_revocation_status=lambda _status, _payload: False, now=NOW,
             )
@@ -201,7 +203,41 @@ class LimitedDelegationTests(unittest.TestCase):
         with self.assertRaisesRegex(delegation.DelegationHold, "expired"):
             self._issue(evidence={**self.evidence, "expires_at": "2026-11-19T02:59:00Z"})
         with self.assertRaisesRegex(delegation.DelegationHold, "cycle2_requires_cycle1_audit_digest"):
-            self._issue(evidence={**self.evidence, "cycle_number": 2})
+            self._issue(evidence={**self.evidence, "task_id": TASK_2, "cycle_number": 2})
+
+    def test_two_cycle_task_binding_is_exact_and_distinct(self):
+        cycle2 = {**self.evidence, "task_id": TASK_2, "cycle_number": 2,
+                  "cycle1_audit_digest": "7" * 64}
+        auth = self._issue(evidence=cycle2)
+        verifier = lambda observed, verified: (
+            observed == cycle2 and verified.cycle_tasks == TASKS
+        )
+        self.assertTrue(delegation.verify_publisher_candidate_authorization(
+            **self._entry_args(auth, evidence=cycle2, evidence_verifier=verifier),
+        ))
+        with self.assertRaisesRegex(ValueError, "two_distinct_cycle_tasks_required"):
+            delegation.build_delegation_payload(
+                delegation_id="fixture-duplicate-tasks", execution_revision=REVISION,
+                cycle_tasks=(TASK, TASK), allowed_paths=("ops/command-tower/example.py",),
+                not_before="2026-11-19T02:00:00Z", expires_at="2026-11-19T04:00:00Z",
+                revocation_sequence=4, delegates={
+                    role: {"key_id": role + "-key",
+                           "public_key": base64.b64encode(key).decode("ascii")}
+                    for role, key in self.delegate_public.items()
+                },
+            )
+        with self.assertRaisesRegex(delegation.DelegationHold, "candidate_scope_mismatch"):
+            self._issue(evidence={**self.evidence, "task_id": TASK_2})
+        with self.assertRaisesRegex(delegation.DelegationHold, "cycle_task_scope_mismatch"):
+            delegation.verify_delegation_contract(
+                envelope=self.contract, trusted_owner_keys=self.trusted,
+                expected_execution_revision=REVISION,
+                expected_cycle_tasks=(TASK_2, TASK),
+                revocation_status=self.status,
+                verify_revocation_status=lambda observed, payload: (
+                    observed == self.status and payload["delegation_id"] == self.status["delegation_id"]
+                ), now=NOW,
+            )
 
     def test_finite_two_cycle_sequence_stops_on_missing_cycle1_audit(self):
         calls = []

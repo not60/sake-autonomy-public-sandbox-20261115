@@ -19,7 +19,7 @@ from f4_limited_delegation import verify_auditor_candidate_authorization
 
 
 def verify_limited_delegation(*, delegation_envelope, trusted_owner_keys,
-                              expected_execution_revision, expected_task_id,
+                              expected_execution_revision, expected_cycle_tasks,
                               revocation_status, verify_revocation_status,
                               authorization, evidence, verify_candidate_evidence,
                               now=None) -> str:
@@ -28,7 +28,7 @@ def verify_limited_delegation(*, delegation_envelope, trusted_owner_keys,
         delegation_envelope=delegation_envelope,
         trusted_owner_keys=trusted_owner_keys,
         expected_execution_revision=expected_execution_revision,
-        expected_task_id=expected_task_id, revocation_status=revocation_status,
+        expected_cycle_tasks=expected_cycle_tasks, revocation_status=revocation_status,
         verify_revocation_status=verify_revocation_status,
         authorization=authorization, evidence=evidence,
         verify_candidate_evidence=verify_candidate_evidence, now=now,

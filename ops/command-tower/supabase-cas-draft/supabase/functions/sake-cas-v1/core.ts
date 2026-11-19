@@ -3,16 +3,19 @@ export const CAS_KEY = "repositories/1458303357/b09-permit-journal-v1.json";
 export const CAS_TEST_KEY = "repositories/1458303357/b09-permit-journal-test-v1.json";
 export const REPOSITORY_ID = 1458303357;
 export const MAX_DOCUMENT_BYTES = 1024 * 1024;
+export const CAS_AUTH_GENERATION = "v2";
+export const CAS_AUTH_GENERATION_ENV = "B09_CAS_AUTH_GENERATION";
+export const CAS_AUTH_GENERATION_HEADER = "x-b09-cas-auth-generation";
 
 const TOKEN_ENV = {
-  issuer: "B09_CAS_ISSUER_BEARER",
-  witness: "B09_CAS_WITNESS_BEARER",
-  publisher: "B09_CAS_TOKEN",
-  auditor: "B09_CAS_READ_TOKEN",
-  testIssuer: "B09_CAS_TEST_ISSUER_BEARER",
-  testWitness: "B09_CAS_TEST_WITNESS_BEARER",
-  testPublisher: "B09_CAS_TEST_PUBLISHER_BEARER",
-  testAuditor: "B09_CAS_TEST_AUDITOR_BEARER",
+  issuer: "B09_CAS_V2_ISSUER_BEARER",
+  witness: "B09_CAS_V2_WITNESS_BEARER",
+  publisher: "B09_CAS_V2_PUBLISHER_BEARER",
+  auditor: "B09_CAS_V2_AUDITOR_BEARER",
+  testIssuer: "B09_CAS_V2_TEST_ISSUER_BEARER",
+  testWitness: "B09_CAS_V2_TEST_WITNESS_BEARER",
+  testPublisher: "B09_CAS_V2_TEST_PUBLISHER_BEARER",
+  testAuditor: "B09_CAS_V2_TEST_AUDITOR_BEARER",
 } as const;
 type Credential = keyof typeof TOKEN_ENV;
 type Role = "issuer" | "witness" | "publisher" | "auditor";
@@ -66,11 +69,14 @@ export async function handleCasRequest(
   request: Request,
   dependencies: CasDependencies,
 ): Promise<Response> {
+  const authGenerationFailure = casAuthGenerationFailure(request, dependencies.env);
+  if (authGenerationFailure !== null) return response(authGenerationFailure);
   const tokens = readRoleTokens(dependencies.env);
-  if (!tokens || !dependencies.store) return response(503);
+  if (!tokens) return response(503);
 
   const principal = identifyPrincipal(request.headers.get("authorization"), tokens);
   if (!principal) return response(401);
+  if (!dependencies.store) return response(503);
 
   const pathname = new URL(request.url).pathname;
   const requestedMode: Mode | null = formalPaths.has(pathname)
@@ -183,6 +189,15 @@ function readRoleTokens(env: CasDependencies["env"]): Record<Credential, string>
     }
   }
   return tokens;
+}
+
+export function casAuthGenerationFailure(
+  request: Request,
+  env: CasDependencies["env"],
+): 401 | 503 | null {
+  if (env.get(CAS_AUTH_GENERATION_ENV) !== CAS_AUTH_GENERATION) return 503;
+  if (request.headers.get(CAS_AUTH_GENERATION_HEADER) !== CAS_AUTH_GENERATION) return 401;
+  return null;
 }
 
 function identifyPrincipal(

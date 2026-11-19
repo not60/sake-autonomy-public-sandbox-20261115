@@ -125,7 +125,7 @@ jobs:
       - name: Verify signed F4 GO and atomically claim this Worker cycle
         env:
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
-          B09_F4_CONTROL_WORKER_BEARER: ${{ secrets.B09_F4_CONTROL_WORKER_BEARER }}
+          B09_F4_CONTROL_V2_WORKER_BEARER: ${{ secrets.B09_F4_CONTROL_V2_WORKER_BEARER }}
           GITHUB_TOKEN: ${{ github.token }}
           F4_CYCLE: ${{ inputs.f4_cycle }}
           F4_BASE_SHA: ${{ inputs.f4_base_sha }}
@@ -317,7 +317,7 @@ jobs:
           F4_BASE_SHA: ${{ inputs.f4_base_sha }}
           B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
-          B09_CAS_TOKEN: ${{ secrets.B09_CAS_TOKEN }}
+          B09_CAS_V2_PUBLISHER_BEARER: ${{ secrets.B09_CAS_V2_PUBLISHER_BEARER }}
           B09_PUBLISHER_GITHUB_TOKEN: ${{ secrets.B09_PUBLISHER_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -477,7 +477,7 @@ jobs:
         env:
           B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
-          B09_CAS_READ_TOKEN: ${{ secrets.B09_CAS_READ_TOKEN }}
+          B09_CAS_V2_AUDITOR_BEARER: ${{ secrets.B09_CAS_V2_AUDITOR_BEARER }}
           F4_BASE_SHA: ${{ inputs.f4_base_sha }}
           GITHUB_TOKEN: ${{ github.token }}
           B09_PR_NUMBER: ${{ needs.publisher.outputs.pr_number }}
@@ -566,7 +566,7 @@ jobs:
         if: ${{ inputs.f4_cycle == '1' }}
         env:
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
-          B09_F4_CONTROL_AUDITOR_BEARER: ${{ secrets.B09_F4_CONTROL_AUDITOR_BEARER }}
+          B09_F4_CONTROL_V2_AUDITOR_BEARER: ${{ secrets.B09_F4_CONTROL_V2_AUDITOR_BEARER }}
           GITHUB_TOKEN: ${{ github.token }}
           F4_BASE_SHA: ${{ inputs.f4_base_sha }}
         run: |

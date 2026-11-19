@@ -14,6 +14,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+AUTH_GENERATION_HEADER = "X-B09-Cas-Auth-Generation"
+AUTH_GENERATION_VALUE = "v2"
+
 
 class CasHold(RuntimeError):
     """CAS state is unavailable, inconsistent, or raced."""
@@ -47,6 +50,7 @@ class HttpsCasBackend:
     def read(self, key: str) -> CasValue | None:
         request = Request(self._url(key), headers={
             "Authorization": f"Bearer {self._token}", "Accept": "application/json",
+            AUTH_GENERATION_HEADER: AUTH_GENERATION_VALUE,
         })
         try:
             with urlopen(request, timeout=self._timeout) as response:
@@ -64,6 +68,7 @@ class HttpsCasBackend:
 
     def compare_and_swap(self, key: str, version: str | None, body: bytes) -> str:
         headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
+        headers[AUTH_GENERATION_HEADER] = AUTH_GENERATION_VALUE
         headers["If-Match" if version is not None else "If-None-Match"] = version or "*"
         request = Request(self._url(key), data=body, method="PUT", headers=headers)
         try:

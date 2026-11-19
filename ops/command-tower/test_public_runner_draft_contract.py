@@ -71,7 +71,7 @@ class PublicRunnerDraftContractTests(unittest.TestCase):
         self.assertEqual(roles["auditor"]["github_permissions"], {
             "contents": "read", "pull_requests": "read", "actions": "read"
         })
-        self.assertEqual(roles["auditor"]["secrets"], ["B09_CAS_READ_TOKEN"])
+        self.assertEqual(roles["auditor"]["secrets"], ["B09_CAS_V2_AUDITOR_BEARER"])
         self.assertEqual(roles["auditor"]["write_permissions"], [])
         self.assertEqual(roles["publisher"]["credential_candidate"]["status"], "NOT_CONFIGURED_NOT_CREATED")
         self.assertEqual(roles["auditor"]["credential_candidate"]["worker_or_publisher_credentials"], "NONE")

@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 AUTH_GENERATION_HEADER = "X-B09-Cas-Auth-Generation"
 AUTH_GENERATION_VALUE = "v2"
+RETIRED_PERMIT_TEST_KEY = "repositories/1458303357/b09-permit-journal-test-v1.json"
 
 
 class CasHold(RuntimeError):
@@ -85,6 +86,8 @@ class HttpsCasBackend:
         return next_version
 
     def _url(self, key: str) -> str:
+        if key == RETIRED_PERMIT_TEST_KEY:
+            raise CasHold("legacy_permit_test_key_retired")
         if not key or key.startswith("/") or ".." in key.split("/"):
             raise ValueError("invalid CAS object key")
         return self._endpoint + "/" + quote(key, safe="/")

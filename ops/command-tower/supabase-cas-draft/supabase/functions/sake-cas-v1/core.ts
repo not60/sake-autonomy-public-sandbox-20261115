@@ -1,26 +1,45 @@
 /** Pure request and journal boundary; no Supabase or network side effects. */
 export const CAS_KEY = "repositories/1458303357/b09-permit-journal-v1.json";
-export const CAS_TEST_KEY = "repositories/1458303357/b09-permit-journal-test-v1.json";
+export const RETIRED_CAS_TEST_KEY = "repositories/1458303357/b09-permit-journal-test-v1.json";
 export const REPOSITORY_ID = 1458303357;
 export const MAX_DOCUMENT_BYTES = 1024 * 1024;
 export const CAS_AUTH_GENERATION = "v2";
 export const CAS_AUTH_GENERATION_ENV = "B09_CAS_AUTH_GENERATION";
 export const CAS_AUTH_GENERATION_HEADER = "x-b09-cas-auth-generation";
 
-const TOKEN_ENV = {
+export const PERMIT_TOKEN_ENV = {
   issuer: "B09_CAS_V2_ISSUER_BEARER",
   witness: "B09_CAS_V2_WITNESS_BEARER",
   publisher: "B09_CAS_V2_PUBLISHER_BEARER",
   auditor: "B09_CAS_V2_AUDITOR_BEARER",
-  testIssuer: "B09_CAS_V2_TEST_ISSUER_BEARER",
-  testWitness: "B09_CAS_V2_TEST_WITNESS_BEARER",
-  testPublisher: "B09_CAS_V2_TEST_PUBLISHER_BEARER",
-  testAuditor: "B09_CAS_V2_TEST_AUDITOR_BEARER",
 } as const;
-type Credential = keyof typeof TOKEN_ENV;
+export const F4_TOKEN_ENV = {
+  owner: "B09_F4_CONTROL_V2_OWNER_BEARER",
+  worker: "B09_F4_CONTROL_V2_WORKER_BEARER",
+  auditor: "B09_F4_CONTROL_V2_AUDITOR_BEARER",
+  read: "B09_F4_CONTROL_V2_READ_BEARER",
+  testOwner: "B09_F4_CONTROL_V2_TEST_OWNER_BEARER",
+  testWorker: "B09_F4_CONTROL_V2_TEST_WORKER_BEARER",
+  testAuditor: "B09_F4_CONTROL_V2_TEST_AUDITOR_BEARER",
+  testRead: "B09_F4_CONTROL_V2_TEST_READ_BEARER",
+} as const;
+const RETIRED_TOKEN_ENV_NAMES = [
+  "B09_CAS_ISSUER_BEARER", "B09_CAS_WITNESS_BEARER", "B09_CAS_TOKEN", "B09_CAS_READ_TOKEN",
+  "B09_CAS_TEST_ISSUER_BEARER", "B09_CAS_TEST_WITNESS_BEARER",
+  "B09_CAS_TEST_PUBLISHER_BEARER", "B09_CAS_TEST_AUDITOR_BEARER",
+  "B09_CAS_V2_TEST_ISSUER_BEARER", "B09_CAS_V2_TEST_WITNESS_BEARER",
+  "B09_CAS_V2_TEST_PUBLISHER_BEARER", "B09_CAS_V2_TEST_AUDITOR_BEARER",
+  "B09_F4_CONTROL_OWNER_BEARER", "B09_F4_CONTROL_WORKER_BEARER",
+  "B09_F4_CONTROL_AUDITOR_BEARER", "B09_F4_CONTROL_READ_BEARER",
+  "B09_F4_TEST_CONTROL_OWNER_BEARER", "B09_F4_TEST_CONTROL_WORKER_BEARER",
+  "B09_F4_TEST_CONTROL_AUDITOR_BEARER", "B09_F4_TEST_CONTROL_READ_BEARER",
+] as const;
+const V2_TOKEN_ENV_NAMES = [
+  ...Object.values(PERMIT_TOKEN_ENV),
+  ...Object.values(F4_TOKEN_ENV),
+] as const;
+type Credential = keyof typeof PERMIT_TOKEN_ENV;
 type Role = "issuer" | "witness" | "publisher" | "auditor";
-type Mode = "formal" | "test";
-type Principal = { mode: Mode; role: Role };
 
 export interface CasStoredDocument {
   revision: number;
@@ -59,16 +78,17 @@ const formalPaths = new Set([
   "/functions/v1/sake-cas-v1/" + CAS_KEY,
   "/" + CAS_KEY,
 ]);
-const testPaths = new Set([
-  "/functions/v1/sake-cas-v1/" + CAS_TEST_KEY,
-  "/" + CAS_TEST_KEY,
+const retiredTestPaths = new Set([
+  "/functions/v1/sake-cas-v1/" + RETIRED_CAS_TEST_KEY,
+  "/" + RETIRED_CAS_TEST_KEY,
 ]);
-const testIdPrefix = "TEST:";
 
 export async function handleCasRequest(
   request: Request,
   dependencies: CasDependencies,
 ): Promise<Response> {
+  const pathname = new URL(request.url).pathname;
+  if (retiredTestPaths.has(pathname)) return response(410);
   const authGenerationFailure = casAuthGenerationFailure(request, dependencies.env);
   if (authGenerationFailure !== null) return response(authGenerationFailure);
   const tokens = readRoleTokens(dependencies.env);
@@ -78,20 +98,15 @@ export async function handleCasRequest(
   if (!principal) return response(401);
   if (!dependencies.store) return response(503);
 
-  const pathname = new URL(request.url).pathname;
-  const requestedMode: Mode | null = formalPaths.has(pathname)
-    ? "formal"
-    : testPaths.has(pathname) ? "test" : null;
-  if (!requestedMode) return response(404);
-  if (principal.mode !== requestedMode) return response(403);
-  const key = requestedMode === "formal" ? CAS_KEY : CAS_TEST_KEY;
+  if (!formalPaths.has(pathname)) return response(404);
+  const key = CAS_KEY;
 
   if (request.method === "GET") {
     try {
       const stored = await dependencies.store.read(key);
       if (!stored) return response(404);
       if (!Number.isSafeInteger(stored.revision) || stored.revision < 1) return response(503);
-      const parsed = await parseJournal(encoder.encode(stored.body), requestedMode);
+      const parsed = await parseJournal(encoder.encode(stored.body));
       if (parsed.repository_id !== REPOSITORY_ID || parsed.sequence !== stored.revision) {
         return response(503);
       }
@@ -111,7 +126,7 @@ export async function handleCasRequest(
   if (request.method !== "PUT") {
     return new Response(null, { status: 405, headers: { allow: "GET, PUT" } });
   }
-  if (principal.role !== "issuer" && principal.role !== "publisher") return response(403);
+  if (principal !== "issuer" && principal !== "publisher") return response(403);
   const contentType = request.headers.get("content-type") ?? "";
   if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType)) {
     return response(415);
@@ -128,7 +143,7 @@ export async function handleCasRequest(
   try {
     bodyBytes = await readBoundedBody(request, MAX_DOCUMENT_BYTES);
     bodyText = new TextDecoder("utf-8", { fatal: true }).decode(bodyBytes);
-    nextJournal = await parseJournal(bodyBytes, requestedMode);
+    nextJournal = await parseJournal(bodyBytes);
   } catch {
     return response(409);
   }
@@ -142,9 +157,9 @@ export async function handleCasRequest(
 
   if (current === undefined) {
     if (ifMatch !== null) return response(412);
-    if (principal.role !== "issuer") return response(403);
+    if (principal !== "issuer") return response(403);
     try {
-      validateFirstIssuance(nextJournal, principal.role);
+      validateFirstIssuance(nextJournal, principal);
     } catch {
       return response(409);
     }
@@ -159,8 +174,8 @@ export async function handleCasRequest(
   if (ifMatch === null || ifMatch !== etag(current.revision)) return response(412);
   let previousJournal: Journal;
   try {
-    previousJournal = await parseJournal(encoder.encode(current.body), requestedMode);
-    validateAppend(previousJournal, nextJournal, principal.role);
+    previousJournal = await parseJournal(encoder.encode(current.body));
+    validateAppend(previousJournal, nextJournal, principal);
   } catch {
     return response(409);
   }
@@ -178,9 +193,23 @@ export async function handleCasRequest(
 }
 
 function readRoleTokens(env: CasDependencies["env"]): Record<Credential, string> | null {
+  const all = readV2RoleTokens(env);
+  if (!all) return null;
+  return {
+    issuer: all[PERMIT_TOKEN_ENV.issuer],
+    witness: all[PERMIT_TOKEN_ENV.witness],
+    publisher: all[PERMIT_TOKEN_ENV.publisher],
+    auditor: all[PERMIT_TOKEN_ENV.auditor],
+  };
+}
+
+export function readV2RoleTokens(
+  env: CasDependencies["env"],
+): Record<(typeof V2_TOKEN_ENV_NAMES)[number], string> | null {
+  if (RETIRED_TOKEN_ENV_NAMES.some((name) => env.get(name) !== undefined)) return null;
   const tokens = Object.fromEntries(
-    Object.entries(TOKEN_ENV).map(([credential, name]) => [credential, env.get(name) ?? ""]),
-  ) as Record<Credential, string>;
+    V2_TOKEN_ENV_NAMES.map((name) => [name, env.get(name) ?? ""]),
+  ) as Record<(typeof V2_TOKEN_ENV_NAMES)[number], string>;
   const values = Object.values(tokens);
   if (values.some((value) => encoder.encode(value).length < 32)) return null;
   for (let i = 0; i < values.length; i++) {
@@ -203,19 +232,15 @@ export function casAuthGenerationFailure(
 function identifyPrincipal(
   authorization: string | null,
   tokens: Record<Credential, string>,
-): Principal | null {
+): Role | null {
   if (!authorization?.startsWith("Bearer ")) return null;
   const candidate = authorization.slice(7);
   let matched: Credential | null = null;
-  for (const credential of Object.keys(TOKEN_ENV) as Credential[]) {
+  for (const credential of Object.keys(PERMIT_TOKEN_ENV) as Credential[]) {
     if (constantTimeEqual(candidate, tokens[credential])) matched = credential;
   }
   if (!matched) return null;
-  const isTest = matched.startsWith("test");
-  const role = (isTest
-    ? matched.slice(4, 5).toLowerCase() + matched.slice(5)
-    : matched) as Role;
-  return { mode: isTest ? "test" : "formal", role };
+  return matched as Role;
 }
 
 function constantTimeEqual(left: string, right: string): boolean {
@@ -252,7 +277,7 @@ async function readBoundedBody(request: Request, limit: number): Promise<Uint8Ar
   return result;
 }
 
-async function parseJournal(bytes: Uint8Array, mode: Mode): Promise<Journal> {
+async function parseJournal(bytes: Uint8Array): Promise<Journal> {
   const document = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
   if (!isObject(document) || !hasExactKeys(document, [
     "schema", "repository_id", "sequence", "head_sha256", "events",
@@ -269,7 +294,7 @@ async function parseJournal(bytes: Uint8Array, mode: Mode): Promise<Journal> {
     ]) || !Number.isSafeInteger(event.sequence) || event.sequence !== index + 1
         || event.previous_sha256 !== previous || !isObject(event.payload)
         || !isSha(event.event_sha256)) throw new Error("event_shape_invalid");
-    validatePayload(event.payload, mode);
+    validatePayload(event.payload);
     const eventBody = {
       sequence: event.sequence,
       previous_sha256: event.previous_sha256,
@@ -285,24 +310,16 @@ async function parseJournal(bytes: Uint8Array, mode: Mode): Promise<Journal> {
   return document as Journal;
 }
 
-function validatePayload(payload: JournalPayload, mode: Mode): void {
+function validatePayload(payload: JournalPayload): void {
   const eventType = payload.event;
   const expected = eventType === "PERMIT_ISSUED"
     ? ["event", "permit_id", "candidate_digest", "permit_digest", "worker_run_id"]
     : eventType === "PERMIT_CONSUMED"
     ? ["event", "permit_id", "candidate_digest", "permit_digest", "witness_digest", "worker_run_id"]
     : null;
-  const testModeId = isNonemptyText(payload.permit_id)
-    && payload.permit_id.startsWith(testIdPrefix)
-    && isNonemptyText(payload.worker_run_id)
-    && payload.worker_run_id.startsWith(testIdPrefix);
-  const formalModeId = isNonemptyText(payload.permit_id)
-    && !payload.permit_id.startsWith(testIdPrefix)
-    && isNonemptyText(payload.worker_run_id)
-    && !payload.worker_run_id.startsWith(testIdPrefix);
   if (!expected || !hasExactKeys(payload, expected)
       || !isNonemptyText(payload.permit_id) || !isNonemptyText(payload.worker_run_id)
-      || (mode === "test" ? !testModeId : !formalModeId)
+      || payload.permit_id.startsWith("TEST:") || payload.worker_run_id.startsWith("TEST:")
       || !isSha(payload.candidate_digest) || !isSha(payload.permit_digest)
       || (eventType === "PERMIT_CONSUMED" && !isSha(payload.witness_digest))) {
     throw new Error("journal_payload_invalid");

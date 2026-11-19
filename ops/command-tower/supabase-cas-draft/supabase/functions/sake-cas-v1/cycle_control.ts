@@ -1,6 +1,8 @@
 /** DRAFT_HOLD F4 cycle-control CAS route, isolated from Permit journal events. */
 import {
+  F4_TOKEN_ENV,
   casAuthGenerationFailure,
+  readV2RoleTokens,
   type CasDependencies,
   type CasStoredDocument,
 } from "./core.ts";
@@ -32,14 +34,14 @@ const auditPayloadFields = [
 ];
 
 const credentials = [
-  ["B09_F4_CONTROL_V2_OWNER_BEARER", "formal", "owner"],
-  ["B09_F4_CONTROL_V2_WORKER_BEARER", "formal", "worker"],
-  ["B09_F4_CONTROL_V2_AUDITOR_BEARER", "formal", "auditor"],
-  ["B09_F4_CONTROL_V2_READ_BEARER", "formal", "reader"],
-  ["B09_F4_CONTROL_V2_TEST_OWNER_BEARER", "test", "owner"],
-  ["B09_F4_CONTROL_V2_TEST_WORKER_BEARER", "test", "worker"],
-  ["B09_F4_CONTROL_V2_TEST_AUDITOR_BEARER", "test", "auditor"],
-  ["B09_F4_CONTROL_V2_TEST_READ_BEARER", "test", "reader"],
+  [F4_TOKEN_ENV.owner, "formal", "owner"],
+  [F4_TOKEN_ENV.worker, "formal", "worker"],
+  [F4_TOKEN_ENV.auditor, "formal", "auditor"],
+  [F4_TOKEN_ENV.read, "formal", "reader"],
+  [F4_TOKEN_ENV.testOwner, "test", "owner"],
+  [F4_TOKEN_ENV.testWorker, "test", "worker"],
+  [F4_TOKEN_ENV.testAuditor, "test", "auditor"],
+  [F4_TOKEN_ENV.testRead, "test", "reader"],
 ] as const;
 
 export async function handleF4ControlRequest(
@@ -108,11 +110,9 @@ export async function handleF4ControlRequest(
 
 function identify(auth: string | null, env: CasDependencies["env"]): { mode: ControlMode; role: ControlRole } | null {
   if (!auth?.startsWith("Bearer ")) return null;
-  const values = credentials.map(([name, mode, role]) => ({ name, mode, role, token: env.get(name) ?? "" }));
-  if (values.some(({ token }) => encoder.encode(token).length < 32)) return null;
-  for (let i = 0; i < values.length; i++) for (let j = i + 1; j < values.length; j++) {
-    if (constantEqual(values[i].token, values[j].token)) return null;
-  }
+  const allTokens = readV2RoleTokens(env);
+  if (!allTokens) return null;
+  const values = credentials.map(([name, mode, role]) => ({ name, mode, role, token: allTokens[name] }));
   const candidate = auth.slice(7);
   const matches = values.filter(({ token }) => constantEqual(candidate, token));
   return matches.length === 1 ? { mode: matches[0].mode, role: matches[0].role } : null;

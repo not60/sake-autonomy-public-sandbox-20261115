@@ -1,5 +1,6 @@
 -- LOCAL DRAFT ONLY. Use only after an approved F4 deployment rollback decision.
--- It restores the original two-key contract and never deletes CAS rows.
+-- It removes F4 keys while retaining the historical Permit TEST row under the
+-- table CHECK only. The restored role/RPC boundary continues to allow formal Permit only.
 BEGIN;
 DO $$
 DECLARE
@@ -32,17 +33,15 @@ BEGIN
     AND pg_catalog.array_to_string(roles, ',') = 'sake_b09_cas_edge' AND cmd = 'ALL'
     AND pg_catalog.regexp_replace(qual, '[[:space:]]+', '', 'g')
       = pg_catalog.regexp_replace(pg_catalog.format(
-        '(cas_key = ANY (ARRAY[%L::text, %L::text, %L::text, %L::text]))',
+        '(cas_key = ANY (ARRAY[%L::text, %L::text, %L::text]))',
         'repositories/1458303357/b09-permit-journal-v1.json',
-        'repositories/1458303357/b09-permit-journal-test-v1.json',
         'repositories/1458303357/b09-f4-cycle-control-v1.json',
         'repositories/1458303357/b09-f4-cycle-control-test-v1.json'
       ), '[[:space:]]+', '', 'g')
     AND pg_catalog.regexp_replace(with_check, '[[:space:]]+', '', 'g')
       = pg_catalog.regexp_replace(pg_catalog.format(
-        '(cas_key = ANY (ARRAY[%L::text, %L::text, %L::text, %L::text]))',
+        '(cas_key = ANY (ARRAY[%L::text, %L::text, %L::text]))',
         'repositories/1458303357/b09-permit-journal-v1.json',
-        'repositories/1458303357/b09-permit-journal-test-v1.json',
         'repositories/1458303357/b09-f4-cycle-control-v1.json',
         'repositories/1458303357/b09-f4-cycle-control-test-v1.json'
       ), '[[:space:]]+', '', 'g');
@@ -61,12 +60,10 @@ ALTER TABLE sake_cas_private.documents ADD CONSTRAINT documents_fixed_public_rep
 CREATE POLICY b09_edge_fixed_key_only ON sake_cas_private.documents
   FOR ALL TO sake_b09_cas_edge
   USING (cas_key = ANY (ARRAY[
-    'repositories/1458303357/b09-permit-journal-v1.json'::text,
-    'repositories/1458303357/b09-permit-journal-test-v1.json'::text
+    'repositories/1458303357/b09-permit-journal-v1.json'::text
   ]))
   WITH CHECK (cas_key = ANY (ARRAY[
-    'repositories/1458303357/b09-permit-journal-v1.json'::text,
-    'repositories/1458303357/b09-permit-journal-test-v1.json'::text
+    'repositories/1458303357/b09-permit-journal-v1.json'::text
   ]));
 
 CREATE OR REPLACE FUNCTION sake_cas_private.insert_if_absent(p_key text, p_document_body text)
@@ -75,8 +72,7 @@ SET search_path = pg_catalog, sake_cas_private AS $$
 DECLARE inserted_revision bigint;
 BEGIN
   IF p_key IS NULL OR p_key <> ALL (ARRAY[
-    'repositories/1458303357/b09-permit-journal-v1.json'::text,
-    'repositories/1458303357/b09-permit-journal-test-v1.json'::text
+    'repositories/1458303357/b09-permit-journal-v1.json'::text
   ]) OR p_document_body IS NULL OR octet_length(convert_to(p_document_body, 'UTF8')) > 1048576 THEN
     RAISE EXCEPTION 'CAS scope or size rejected' USING ERRCODE = '22023';
   END IF;
@@ -92,8 +88,7 @@ SET search_path = pg_catalog, sake_cas_private AS $$
 DECLARE updated_revision bigint;
 BEGIN
   IF p_key IS NULL OR p_key <> ALL (ARRAY[
-    'repositories/1458303357/b09-permit-journal-v1.json'::text,
-    'repositories/1458303357/b09-permit-journal-test-v1.json'::text
+    'repositories/1458303357/b09-permit-journal-v1.json'::text
   ]) OR p_document_body IS NULL OR p_expected_revision IS NULL OR p_expected_revision <= 0
      OR octet_length(convert_to(p_document_body, 'UTF8')) > 1048576 THEN
     RAISE EXCEPTION 'CAS scope, revision, or size rejected' USING ERRCODE = '22023';

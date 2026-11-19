@@ -7,6 +7,10 @@ const names = [
   "B09_F4_CONTROL_V2_TEST_OWNER_BEARER", "B09_F4_CONTROL_V2_TEST_WORKER_BEARER", "B09_F4_CONTROL_V2_TEST_AUDITOR_BEARER", "B09_F4_CONTROL_V2_TEST_READ_BEARER",
 ];
 const envValues = Object.fromEntries(names.map((name, i) => [name, `fixture-f4-control-v2-role-${i}-long-unique-token` ]));
+for (const [i, name] of [
+  "B09_CAS_V2_ISSUER_BEARER", "B09_CAS_V2_WITNESS_BEARER",
+  "B09_CAS_V2_PUBLISHER_BEARER", "B09_CAS_V2_AUDITOR_BEARER",
+].entries()) envValues[name] = `fixture-permit-v2-role-${i}-long-unique-token`;
 envValues.B09_CAS_AUTH_GENERATION = "v2";
 const b64 = (value) => btoa(String.fromCharCode(...new Uint8Array(value)));
 const signingKeys = {};
@@ -137,6 +141,22 @@ test("F4 control rejects legacy Bearer-only requests before DB access", async ()
   envValues.B09_CAS_AUTH_GENERATION = "v1";
   assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_V2_READ_BEARER"), deps)).status, 503);
   envValues.B09_CAS_AUTH_GENERATION = configuredGeneration;
+  assert.equal(store.reads, 0);
+});
+
+test("Permit and F4 credentials cannot be reused across handler roles", async () => {
+  store.reads = 0;
+  const permitBearer = envValues.B09_CAS_V2_ISSUER_BEARER;
+  const response = await handleF4ControlRequest(new Request(
+    `https://fixture.invalid/functions/v1/sake-cas-v1/${F4_CONTROL_KEY}`,
+    { method: "GET", headers: { authorization: `Bearer ${permitBearer}`, "x-b09-cas-auth-generation": "v2" } },
+  ), deps);
+  assert.equal(response.status, 401);
+  assert.equal(store.reads, 0);
+
+  const reused = { ...envValues, B09_F4_CONTROL_V2_WORKER_BEARER: permitBearer };
+  const reusedDeps = { env: { get: (name) => reused[name] }, store };
+  assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_V2_READ_BEARER"), reusedDeps)).status, 401);
   assert.equal(store.reads, 0);
 });
 

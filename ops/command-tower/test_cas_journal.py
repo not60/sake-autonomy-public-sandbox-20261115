@@ -130,16 +130,18 @@ class PermitCasJournalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PermitCasJournal(self.backend, repository_id=1234, mode="test")
 
-    def test_https_backend_preserves_the_exact_test_key_route(self) -> None:
+    def test_https_backend_rejects_retired_test_key_without_network(self) -> None:
         backend = HttpsCasBackend(
             endpoint="https://cas.example.invalid/functions/v1/sake-cas-v1",
             bearer_token="test-only",
         )
-        self.assertEqual(
-            backend._url("repositories/1458303357/b09-permit-journal-test-v1.json"),
-            "https://cas.example.invalid/functions/v1/sake-cas-v1/"
-            "repositories/1458303357/b09-permit-journal-test-v1.json",
-        )
+        retired_key = "repositories/1458303357/b09-permit-journal-test-v1.json"
+        with patch("cas_journal.urlopen") as fake_urlopen:
+            with self.assertRaisesRegex(CasHold, "legacy_permit_test_key_retired"):
+                backend.read(retired_key)
+            with self.assertRaisesRegex(CasHold, "legacy_permit_test_key_retired"):
+                backend.compare_and_swap(retired_key, None, b"{}")
+        fake_urlopen.assert_not_called()
 
     def test_http_backend_uses_conditional_https_put_without_network(self) -> None:
         class Response:

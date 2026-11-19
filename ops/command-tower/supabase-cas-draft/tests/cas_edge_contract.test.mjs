@@ -3,8 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   CAS_KEY,
-  CAS_TEST_KEY,
   MAX_DOCUMENT_BYTES,
+  RETIRED_CAS_TEST_KEY,
   handleCasRequest,
 } from "../supabase/functions/sake-cas-v1/core.ts";
 
@@ -13,20 +13,20 @@ const tokens = {
   B09_CAS_V2_WITNESS_BEARER: "fixture-v2-witness-token-0123456789-abcde",
   B09_CAS_V2_PUBLISHER_BEARER: "fixture-v2-publisher-token-0123456789-abcd",
   B09_CAS_V2_AUDITOR_BEARER: "fixture-v2-auditor-token-0123456789-abcdefg",
-  B09_CAS_V2_TEST_ISSUER_BEARER: "fixture-v2-test-issuer-token-0123456789-abcdef",
-  B09_CAS_V2_TEST_WITNESS_BEARER: "fixture-v2-test-witness-token-0123456789-abcde",
-  B09_CAS_V2_TEST_PUBLISHER_BEARER: "fixture-v2-test-publisher-token-0123456789-abcd",
-  B09_CAS_V2_TEST_AUDITOR_BEARER: "fixture-v2-test-auditor-token-0123456789-abcdefg",
+  B09_F4_CONTROL_V2_OWNER_BEARER: "fixture-f4-v2-owner-token-0123456789-abcde",
+  B09_F4_CONTROL_V2_WORKER_BEARER: "fixture-f4-v2-worker-token-0123456789-abcde",
+  B09_F4_CONTROL_V2_AUDITOR_BEARER: "fixture-f4-v2-auditor-token-0123456789-abcd",
+  B09_F4_CONTROL_V2_READ_BEARER: "fixture-f4-v2-read-token-0123456789-abcdefg",
+  B09_F4_CONTROL_V2_TEST_OWNER_BEARER: "fixture-f4-v2-test-owner-token-0123456789-abcde",
+  B09_F4_CONTROL_V2_TEST_WORKER_BEARER: "fixture-f4-v2-test-worker-token-0123456789-abcde",
+  B09_F4_CONTROL_V2_TEST_AUDITOR_BEARER: "fixture-f4-v2-test-auditor-token-0123456789-abcd",
+  B09_F4_CONTROL_V2_TEST_READ_BEARER: "fixture-f4-v2-test-read-token-0123456789-abcdefg",
 };
 const roleTokens = {
   issuer: "B09_CAS_V2_ISSUER_BEARER",
   witness: "B09_CAS_V2_WITNESS_BEARER",
   publisher: "B09_CAS_V2_PUBLISHER_BEARER",
   auditor: "B09_CAS_V2_AUDITOR_BEARER",
-  testIssuer: "B09_CAS_V2_TEST_ISSUER_BEARER",
-  testWitness: "B09_CAS_V2_TEST_WITNESS_BEARER",
-  testPublisher: "B09_CAS_V2_TEST_PUBLISHER_BEARER",
-  testAuditor: "B09_CAS_V2_TEST_AUDITOR_BEARER",
 };
 
 class FixtureStore {
@@ -57,34 +57,6 @@ class FixtureStore {
     if (this.failNextWrite) throw new Error("fixture_db_failure");
     if (!this.value || this.value.revision !== revision) return undefined;
     this.value = { revision: revision + 1, body };
-    return revision + 1;
-  }
-}
-
-class ScopedFixtureStore {
-  values = new Map();
-  reads = 0;
-  inserts = 0;
-  updates = 0;
-
-  async read(key) {
-    this.reads++;
-    const value = this.values.get(key);
-    return value && { ...value };
-  }
-
-  async insertIfAbsent(key, body) {
-    this.inserts++;
-    if (this.values.has(key)) return undefined;
-    this.values.set(key, { revision: 1, body });
-    return 1;
-  }
-
-  async updateIfRevision(key, revision, body) {
-    this.updates++;
-    const current = this.values.get(key);
-    if (!current || current.revision !== revision) return undefined;
-    this.values.set(key, { revision: revision + 1, body });
     return revision + 1;
   }
 }
@@ -187,6 +159,25 @@ test("role credentials are distinct; missing and rejected credentials fail close
   assert.equal((await handleCasRequest(request("GET", "auditor"), deps(store, {
     B09_CAS_V2_AUDITOR_BEARER: "",
   }))).status, 503);
+  assert.equal((await handleCasRequest(request("GET", "auditor"), deps(store, {
+    B09_F4_CONTROL_V2_WORKER_BEARER: tokens.B09_CAS_V2_ISSUER_BEARER,
+  }))).status, 503);
+  assert.equal((await handleCasRequest(request("GET", "auditor"), deps(store, {
+    B09_CAS_TEST_ISSUER_BEARER: "retired-permit-test-fixture-secret-placeholder",
+  }))).status, 503);
+  for (const name of [
+    "B09_CAS_V2_TEST_ISSUER_BEARER",
+    "B09_CAS_V2_TEST_WITNESS_BEARER",
+    "B09_CAS_V2_TEST_PUBLISHER_BEARER",
+    "B09_CAS_V2_TEST_AUDITOR_BEARER",
+  ]) {
+    assert.equal((await handleCasRequest(request("GET", "auditor"), deps(store, {
+      [name]: "retired-v2-permit-test-fixture-secret-placeholder",
+    }))).status, 503);
+  }
+  assert.equal((await handleCasRequest(request("GET", null, {
+    headers: { authorization: "Bearer " + tokens.B09_F4_CONTROL_V2_WORKER_BEARER },
+  }), deps(store))).status, 401);
   assert.equal(store.reads, 0);
 });
 
@@ -301,7 +292,7 @@ test("failed or ambiguous store write is held once and never retried", async () 
   assert.equal(store.value.revision, 1);
 });
 
-test("only the fixed formal and TEST keys plus GET/PUT methods are accepted", async () => {
+test("only the fixed formal key plus GET/PUT methods are accepted", async () => {
   const store = new FixtureStore();
   assert.equal((await handleCasRequest(request("GET", "auditor", {
     path: "/other-key",
@@ -315,17 +306,27 @@ test("only the fixed formal and TEST keys plus GET/PUT methods are accepted", as
   assert.equal(store.inserts, 0);
 });
 
-test("SQL candidate denies Data API roles and has revision-conditional atomic operations", async () => {
+test("SQL candidates retain historic Permit TEST rows without granting executable access", async () => {
   const sql = await readFile(new URL("../schema.sql", import.meta.url), "utf8");
+  const migration = await readFile(new URL("../migrations/20261119000100_f4_cycle_control.sql", import.meta.url), "utf8");
+  const rollback = await readFile(new URL("../migrations/20261119000100_f4_cycle_control.rollback.sql", import.meta.url), "utf8");
   assert.match(sql, /CREATE SCHEMA IF NOT EXISTS sake_cas_private/);
   assert.match(sql, /REVOKE ALL ON SCHEMA sake_cas_private FROM PUBLIC, anon, authenticated, service_role/);
-  assert.match(sql, /ON CONFLICT \(cas_key\) DO NOTHING/);
-  assert.match(sql, /WHERE cas_key = p_key AND revision = p_expected_revision/);
+  assert.match(migration, /ON CONFLICT \(cas_key\) DO NOTHING/);
+  assert.match(migration, /WHERE cas_key = p_key AND revision = p_expected_revision/);
   assert.match(sql, /NOBYPASSRLS/);
   assert.match(sql, /b09-permit-journal-test-v1\.json/);
-  assert.match(sql, /cas_key = ANY \(ARRAY/);
-  assert.doesNotMatch(sql, /GRANT\s+[^;]*\bDELETE\b/i);
-  assert.doesNotMatch(sql, /GRANT\s+[^;]*\bTRUNCATE\b/i);
+  assert.match(migration, /b09-permit-journal-test-v1\.json/);
+  const activePolicy = migration.split("CREATE POLICY b09_edge_fixed_key_only", 2)[1]
+    .split("CREATE OR REPLACE FUNCTION", 1)[0];
+  const activeRpcs = migration.split("CREATE OR REPLACE FUNCTION sake_cas_private.insert_if_absent", 2)[1];
+  assert.doesNotMatch(activePolicy + activeRpcs, /b09-permit-journal-test-v1\.json/);
+  assert.match(rollback, /b09-permit-journal-test-v1\.json/);
+  const rollbackPolicy = rollback.split("CREATE POLICY b09_edge_fixed_key_only", 2)[1]
+    .split("CREATE OR REPLACE FUNCTION", 1)[0];
+  const rollbackRpcs = rollback.split("CREATE OR REPLACE FUNCTION sake_cas_private.insert_if_absent", 2)[1];
+  assert.doesNotMatch(rollbackPolicy + rollbackRpcs, /b09-permit-journal-test-v1\.json/);
+  assert.doesNotMatch(migration + rollback, /\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE)\b/i);
 });
 
 test("Edge candidate matches existing CAS caller secret names and does not use service keys", async () => {
@@ -337,102 +338,57 @@ test("Edge candidate matches existing CAS caller secret names and does not use s
   assert.match(core, /B09_CAS_V2_AUDITOR_BEARER/);
   assert.match(core, /B09_CAS_V2_ISSUER_BEARER/);
   assert.match(core, /B09_CAS_V2_WITNESS_BEARER/);
-  assert.match(core, /B09_CAS_V2_TEST_ISSUER_BEARER/);
-  assert.match(core, /B09_CAS_V2_TEST_WITNESS_BEARER/);
-  assert.match(core, /B09_CAS_V2_TEST_PUBLISHER_BEARER/);
-  assert.match(core, /B09_CAS_V2_TEST_AUDITOR_BEARER/);
+  assert.match(core, /RETIRED_CAS_TEST_KEY/);
+  const permitRegistry = core.split("export const PERMIT_TOKEN_ENV = {", 2)[1].split("} as const;", 1)[0];
+  assert.doesNotMatch(permitRegistry, /B09_CAS_V2_TEST_(?:ISSUER|WITNESS|PUBLISHER|AUDITOR)_BEARER/);
+  assert.match(core, /B09_CAS_V2_TEST_(?:ISSUER|WITNESS|PUBLISHER|AUDITOR)_BEARER/);
   assert.match(core, /B09_CAS_AUTH_GENERATION/);
-  assert.doesNotMatch(core, /"B09_CAS_(?:ISSUER_BEARER|WITNESS_BEARER|TOKEN|READ_TOKEN|TEST_)/);
+  assert.match(core, /retiredTestPaths\.has\(pathname\).*response\(410\)/s);
+  assert.match(core, /RETIRED_TOKEN_ENV_NAMES\.some\(\(name\) => env\.get\(name\) !== undefined\)/);
   assert.match(index, /B09_CAS_DB_URL/);
+  assert.doesNotMatch(index, /CAS_TEST_KEY/);
+  assert.doesNotMatch(index, /b09-permit-journal-test-v1\.json/);
   assert.doesNotMatch(index, /SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY/);
   assert.doesNotMatch(index + core, /console\.(?:log|error|warn)/);
   assert.match(config, /verify_jwt = false/);
   assert.ok(root.pathname.endsWith("/supabase-cas-draft/"));
 });
 
-test("TEST scope rejects cross-key credentials before touching the CAS store", async () => {
-  const store = new ScopedFixtureStore();
-  const formalPath = "/functions/v1/sake-cas-v1/" + CAS_KEY;
-  const testPath = "/functions/v1/sake-cas-v1/" + CAS_TEST_KEY;
-  const testBody = await makeJournal([{
-    ...issuedPayload,
-    permit_id: "TEST:fixture-permit-cross-scope",
-    worker_run_id: "TEST:fixture-run-cross-scope",
-  }]);
+test("retired Permit TEST paths reject every method, credential, and generation before DB access", async () => {
+  const store = new FixtureStore();
+  const paths = [
+    "/functions/v1/sake-cas-v1/" + RETIRED_CAS_TEST_KEY,
+    "/" + RETIRED_CAS_TEST_KEY,
+  ];
+  const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+  const authValues = [
+    null,
+    "Bearer retired-old-generation-fixture",
+    ...Object.values(tokens).map((value) => "Bearer " + value),
+  ];
+  const generations = [null, "v1", "v2"];
 
-  assert.equal((await handleCasRequest(request("GET", "testAuditor", {
-    path: formalPath,
-  }), deps(store))).status, 403);
-  assert.equal((await handleCasRequest(request("GET", "auditor", {
-    path: testPath,
-  }), deps(store))).status, 403);
-  assert.equal((await handleCasRequest(request("GET", "testAuditor", {
-    path: "/functions/v1/sake-cas-v1/repositories/other/journal.json",
-  }), deps(store))).status, 404);
-  assert.equal((await handleCasRequest(request("PUT", "testIssuer", {
-    path: formalPath,
-    body: testBody,
-    headers: { "if-none-match": "*", "content-type": "application/json" },
-  }), deps(store))).status, 403);
-  assert.equal((await handleCasRequest(request("PUT", "issuer", {
-    path: testPath,
-    body: testBody,
-    headers: { "if-none-match": "*", "content-type": "application/json" },
-  }), deps(store))).status, 403);
+  for (const path of paths) {
+    for (const method of methods) {
+      for (const authorization of authValues) {
+        for (const generation of generations) {
+          const headers = new Headers();
+          if (authorization !== null) headers.set("authorization", authorization);
+          if (generation !== null) headers.set("x-b09-cas-auth-generation", generation);
+          if (method === "PUT" || method === "POST" || method === "PATCH") {
+            headers.set("content-type", "application/json");
+          }
+          const response = await handleCasRequest(new Request("https://fixture.invalid" + path, {
+            method,
+            headers,
+            body: method === "PUT" || method === "POST" || method === "PATCH" ? "{}" : undefined,
+          }), deps(store));
+          assert.equal(response.status, 410, `${method} ${path} generation=${generation}`);
+        }
+      }
+    }
+  }
   assert.equal(store.reads, 0);
   assert.equal(store.inserts, 0);
-});
-
-test("TEST scope writes persist only the TEST key and require TEST Permit/run IDs", async () => {
-  const store = new ScopedFixtureStore();
-  const testPath = "/functions/v1/sake-cas-v1/" + CAS_TEST_KEY;
-  const testIssued = {
-    ...issuedPayload,
-    permit_id: "TEST:fixture-permit-1",
-    worker_run_id: "TEST:fixture-run-1",
-  };
-  const body = await makeJournal([testIssued]);
-  const response = await handleCasRequest(request("PUT", "testIssuer", {
-    body,
-    path: testPath,
-    headers: { "if-none-match": "*", "content-type": "application/json" },
-  }), deps(store));
-
-  assert.equal(response.status, 204);
-  assert.equal(store.values.has(CAS_KEY), false);
-  assert.equal(store.values.has(CAS_TEST_KEY), true);
-  const testConsumed = {
-    ...consumedPayload,
-    permit_id: testIssued.permit_id,
-    worker_run_id: testIssued.worker_run_id,
-  };
-  const appendedBody = await makeJournal([testIssued, testConsumed]);
-  const appended = await handleCasRequest(request("PUT", "testPublisher", {
-    body: appendedBody,
-    path: testPath,
-    headers: { "if-match": '"1"', "content-type": "application/json" },
-  }), deps(store));
-  assert.equal(appended.status, 204);
-  assert.equal(appended.headers.get("etag"), '"2"');
-  assert.equal((await handleCasRequest(request("GET", "testAuditor", {
-    path: testPath,
-  }), deps(store))).status, 200);
-  assert.equal((await handleCasRequest(request("GET", "testWitness", {
-    path: testPath,
-  }), deps(store))).status, 200);
-  assert.equal((await handleCasRequest(request("GET", "auditor"), deps(store))).status, 404);
-
-  const badBody = await makeJournal([issuedPayload]);
-  const rejected = await handleCasRequest(request("PUT", "testIssuer", {
-    body: badBody,
-    path: "/functions/v1/sake-cas-v1/" + CAS_TEST_KEY,
-    headers: { "if-none-match": "*", "content-type": "application/json" },
-  }), deps(new ScopedFixtureStore()));
-  assert.equal(rejected.status, 409);
-
-  const formalReject = await handleCasRequest(request("PUT", "issuer", {
-    body,
-    headers: { "if-none-match": "*", "content-type": "application/json" },
-  }), deps(new ScopedFixtureStore()));
-  assert.equal(formalReject.status, 409);
+  assert.equal(store.updates, 0);
 });

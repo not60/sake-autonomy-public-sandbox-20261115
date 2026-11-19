@@ -1,5 +1,6 @@
 -- LOCAL DRAFT ONLY. Exact-SHA Owner approval is required before applying.
--- Extends the existing fixed-key CAS store without changing Permit journal rows/events.
+-- Extends the CAS store without changing rows/events; the historical Permit TEST key
+-- stays admissible to the table CHECK only and is removed from executable access.
 BEGIN;
 
 DO $$
@@ -99,13 +100,11 @@ CREATE POLICY b09_edge_fixed_key_only ON sake_cas_private.documents
   FOR ALL TO sake_b09_cas_edge
   USING (cas_key = ANY (ARRAY[
     'repositories/1458303357/b09-permit-journal-v1.json'::text,
-    'repositories/1458303357/b09-permit-journal-test-v1.json'::text,
     'repositories/1458303357/b09-f4-cycle-control-v1.json'::text,
     'repositories/1458303357/b09-f4-cycle-control-test-v1.json'::text
   ]))
   WITH CHECK (cas_key = ANY (ARRAY[
     'repositories/1458303357/b09-permit-journal-v1.json'::text,
-    'repositories/1458303357/b09-permit-journal-test-v1.json'::text,
     'repositories/1458303357/b09-f4-cycle-control-v1.json'::text,
     'repositories/1458303357/b09-f4-cycle-control-test-v1.json'::text
   ]));
@@ -118,7 +117,6 @@ DECLARE inserted_revision bigint;
 BEGIN
   IF p_key IS NULL OR p_key <> ALL (ARRAY[
        'repositories/1458303357/b09-permit-journal-v1.json'::text,
-       'repositories/1458303357/b09-permit-journal-test-v1.json'::text,
        'repositories/1458303357/b09-f4-cycle-control-v1.json'::text,
        'repositories/1458303357/b09-f4-cycle-control-test-v1.json'::text
      ]) OR p_document_body IS NULL
@@ -140,7 +138,6 @@ DECLARE updated_revision bigint;
 BEGIN
   IF p_key IS NULL OR p_key <> ALL (ARRAY[
        'repositories/1458303357/b09-permit-journal-v1.json'::text,
-       'repositories/1458303357/b09-permit-journal-test-v1.json'::text,
        'repositories/1458303357/b09-f4-cycle-control-v1.json'::text,
        'repositories/1458303357/b09-f4-cycle-control-test-v1.json'::text
      ]) OR p_document_body IS NULL OR p_expected_revision IS NULL

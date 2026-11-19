@@ -31,6 +31,11 @@ class F4ExternalCandidateTests(unittest.TestCase):
         self.assertIn("WHERE cas_key = p_key AND revision = p_expected_revision", sql)
         self.assertIn("RAISE EXCEPTION 'F4 migration RLS policy drift'", sql)
         self.assertIn("F4 cycle-control key already exists; do not overwrite", sql)
+        policy = sql.split("CREATE POLICY b09_edge_fixed_key_only", 1)[1].split(
+            "CREATE OR REPLACE FUNCTION", 1
+        )[0]
+        rpcs = sql.split("CREATE OR REPLACE FUNCTION sake_cas_private.insert_if_absent", 1)[1]
+        self.assertNotIn("b09-permit-journal-test-v1.json", policy + rpcs)
 
     def test_rollback_is_guarded_and_never_deletes_cycle_records(self) -> None:
         sql = ROLLBACK.read_text(encoding="utf-8")
@@ -42,15 +47,22 @@ class F4ExternalCandidateTests(unittest.TestCase):
         self.assertNotRegex(sql, r"(?i)\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE)\b")
         self.assertIn("documents_fixed_public_repo_key", sql)
         self.assertIn("b09-f4-cycle-control-test-v1.json", sql)
+        policy = sql.split("CREATE POLICY b09_edge_fixed_key_only", 1)[1].split(
+            "CREATE OR REPLACE FUNCTION", 1
+        )[0]
+        rpcs = sql.split("CREATE OR REPLACE FUNCTION sake_cas_private.insert_if_absent", 1)[1]
+        self.assertNotIn("b09-permit-journal-test-v1.json", policy + rpcs)
 
     def test_edge_boundary_is_separate_and_cycle_two_requires_auditor_event(self) -> None:
         edge = EDGE.read_text(encoding="utf-8")
         index = INDEX.read_text(encoding="utf-8")
-        self.assertIn("B09_F4_CONTROL_V2_OWNER_BEARER", edge)
-        self.assertIn("B09_F4_CONTROL_V2_WORKER_BEARER", edge)
-        self.assertIn("B09_F4_CONTROL_V2_AUDITOR_BEARER", edge)
-        self.assertIn("B09_F4_CONTROL_V2_READ_BEARER", edge)
-        self.assertIn("B09_F4_CONTROL_V2_TEST_OWNER_BEARER", edge)
+        core = (ROOT / "ops/command-tower/supabase-cas-draft/supabase/functions/sake-cas-v1/core.ts").read_text(encoding="utf-8")
+        for role in ("OWNER", "WORKER", "AUDITOR", "READ", "TEST_OWNER", "TEST_WORKER", "TEST_AUDITOR", "TEST_READ"):
+            self.assertIn(f"B09_F4_CONTROL_V2_{role}_BEARER", core)
+        self.assertIn("F4_TOKEN_ENV.owner", edge)
+        self.assertIn("F4_TOKEN_ENV.worker", edge)
+        self.assertIn("F4_TOKEN_ENV.auditor", edge)
+        self.assertIn("readV2RoleTokens", edge)
         self.assertIn("event.event === \"CYCLE_CLAIMED\" ? role === \"worker\"", edge)
         self.assertIn("event.event === \"CYCLE1_AUDITOR_PASS\" ? role === \"auditor\"", edge)
         self.assertIn("cycle === 2 && (!audited || claims.length !== 1)", edge)
@@ -59,6 +71,7 @@ class F4ExternalCandidateTests(unittest.TestCase):
         self.assertIn("updateIfRevision", edge)
         self.assertIn("handleF4ControlRequest", index)
         self.assertIn("...F4_CONTROL_KEYS", index)
+        self.assertNotIn("b09-permit-journal-test-v1.json", index)
 
     def test_workflow_cross_run_artifact_path_is_pinned_and_jobs_remain_hard_disabled(self) -> None:
         source = WORKFLOW.read_text(encoding="utf-8")

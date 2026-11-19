@@ -11,11 +11,21 @@ const fields = {
   CONTROL_CREATED: ["event", "revocation_status"],
   REVOCATION_STATUS: ["event", "revocation_status"],
   CYCLE_CLAIMED: ["event", "cycle_number", "run_id", "go_sha256", "revocation_sequence", "revocation_digest", "claimed_at", "source_commit_sha"],
-  CYCLE1_AUDITOR_PASS: ["event", "artifact_envelope_sha256", "artifact_id", "artifact_archive_digest", "workflow_run_id", "run_attempt", "worker_run_id", "auditor_run_id", "source_commit_sha"],
+  CYCLE1_AUDITOR_PASS: ["event", "artifact_envelope_sha256", "artifact_id", "artifact_archive_digest", "workflow_run_id", "run_attempt", "worker_run_id", "auditor_run_id", "source_commit_sha", "auditor_envelope"],
 } as const;
 type EventKind = keyof typeof fields;
 type ControlRole = "owner" | "worker" | "auditor" | "reader";
 type ControlMode = "formal" | "test";
+
+const AUDIT_WORKFLOW_PATH = ".github/workflows/public-runner-draft.yml";
+const auditPayloadFields = [
+  "schema", "kind", "repository_id", "approval_id", "go_sha256", "cycle_number",
+  "worker_run_id", "auditor_run_id", "workflow_run_id", "run_attempt", "workflow_path",
+  "source_commit_sha", "base_sha", "pr_number", "pr_state", "pr_is_draft", "pr_merged",
+  "pr_head_sha", "pr_base_sha", "readonly_ci_run_id", "readonly_ci_conclusion",
+  "permit_id", "candidate_digest", "witness_digest", "journal_revision",
+  "journal_head_sha256", "result", "issued_at", "expires_at",
+];
 
 const credentials = [
   ["B09_F4_CONTROL_OWNER_BEARER", "formal", "owner"],
@@ -45,7 +55,7 @@ export async function handleF4ControlRequest(
     try {
       const stored = await dependencies.store.read(key);
       if (!stored) return response(404);
-      await validateDocument(stored, mode);
+      await validateDocument(stored, mode, dependencies.env);
       return new Response(stored.body, {
         status: 200,
         headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", etag: etag(stored.revision) },
@@ -65,7 +75,7 @@ export async function handleF4ControlRequest(
     const body = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     const parsed = JSON.parse(body) as { sequence: number };
     next = { revision: parsed.sequence, body };
-    await validateDocument(next, mode);
+    await validateDocument(next, mode, dependencies.env);
   } catch { return response(409); }
 
   try {
@@ -76,7 +86,7 @@ export async function handleF4ControlRequest(
       return revision === undefined ? response(412) : new Response(null, { status: 204, headers: { etag: etag(revision) } });
     }
     if (!current || ifMatch !== etag(current.revision)) return response(412);
-    await validateDocument(current, mode);
+    await validateDocument(current, mode, dependencies.env);
     const previous = JSON.parse(current.body) as { events: Array<{ payload: Record<string, unknown> }> };
     const after = JSON.parse(next.body) as Record<string, unknown> & { events: Array<{ payload: Record<string, unknown> }> };
     const appendedKind = after.events[after.events.length - 1]?.payload?.event;
@@ -102,7 +112,7 @@ function identify(auth: string | null, env: CasDependencies["env"]): { mode: Con
   return matches.length === 1 ? { mode: matches[0].mode, role: matches[0].role } : null;
 }
 
-async function validateDocument(stored: CasStoredDocument, mode: ControlMode): Promise<void> {
+async function validateDocument(stored: CasStoredDocument, mode: ControlMode, env: CasDependencies["env"]): Promise<void> {
   const value = JSON.parse(stored.body) as Record<string, unknown>;
   const expected = ["schema", "repository_id", "approval_id", "go_sha256", "base_sha", "go_revocation_sequence", "revocation_sequence", "sequence", "head_sha256", "events"];
   if (!exact(value, expected) || value.schema !== 1 || value.repository_id !== REPOSITORY_ID
@@ -128,6 +138,7 @@ async function validateDocument(stored: CasStoredDocument, mode: ControlMode): P
   if (value.head_sha256 !== previous || value.revocation_sequence !== revocationSequence(value.events as Array<{ payload: Record<string, unknown> }>)) throw new Error("control_head_invalid");
   if (mode === "test" && value.approval_id.toString().startsWith("TEST:") === false) throw new Error("test_control_scope_invalid");
   if (mode === "formal" && value.approval_id.toString().startsWith("TEST:")) throw new Error("formal_control_scope_invalid");
+  await verifyStoredSignatures(value, env);
   if (!validHistory(value.events as Array<{ payload: Record<string, unknown> }>, value)) throw new Error("control_transition_invalid");
 }
 
@@ -191,7 +202,8 @@ function validHistory(events: Array<{ payload: Record<string, unknown> }>, docum
           || typeof payload.artifact_archive_digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(payload.artifact_archive_digest)
           || typeof payload.workflow_run_id !== "string" || !/^\d+$/.test(payload.workflow_run_id)
           || typeof payload.auditor_run_id !== "string" || !payload.auditor_run_id
-          || !Number.isSafeInteger(payload.run_attempt) || Number(payload.run_attempt) < 1) return false;
+          || !Number.isSafeInteger(payload.run_attempt) || Number(payload.run_attempt) < 1
+          || !payload.auditor_envelope || typeof payload.auditor_envelope !== "object" || Array.isArray(payload.auditor_envelope)) return false;
       audited = true;
       continue;
     }
@@ -229,6 +241,140 @@ function signedRevocation(value: unknown): boolean {
       && typeof item.signature === "string" && /^[A-Za-z0-9+/]{86}==$/.test(item.signature)
       && canonical(item.payload) === canonical(payload))
     && ownerA.key_id !== ownerB.key_id;
+}
+
+type VerificationKey = { key_id: string; role: string; public_key: Uint8Array };
+
+async function verifyStoredSignatures(document: Record<string, unknown>, env: CasDependencies["env"]): Promise<void> {
+  const ownerKeys = loadOwnerKeys(env);
+  const auditorKey = loadAuditorKey(env, ownerKeys);
+  const events = document.events as Array<{ payload: Record<string, unknown> }>;
+  for (const entry of events) {
+    const event = entry.payload;
+    if (event.event === "CONTROL_CREATED" || event.event === "REVOCATION_STATUS") {
+      const envelope = event.revocation_status as Record<string, unknown>;
+      const payload = envelope?.payload as Record<string, unknown>;
+      const approvals = envelope?.approvals as Record<string, Record<string, unknown>>;
+      for (const role of ["owner_a", "owner_b"] as const) {
+        const approval = approvals?.[role];
+        const key = approval && ownerKeys.get(String(approval.key_id));
+        if (!key || key.role !== role || !await verifyEnvelope(approval, key, payload)) {
+          throw new Error("owner_signature_invalid");
+        }
+      }
+      const validFrom = Date.parse(String(payload.valid_from ?? ""));
+      const validUntil = Date.parse(String(payload.valid_until ?? ""));
+      if (!Number.isFinite(validFrom) || !Number.isFinite(validUntil)
+          || validUntil <= validFrom || Date.now() < validFrom || Date.now() >= validUntil
+          || payload.approval_id !== document.approval_id || payload.go_sha256 !== document.go_sha256) {
+        throw new Error("owner_revocation_scope_or_validity_invalid");
+      }
+    }
+    if (event.event === "CYCLE1_AUDITOR_PASS") {
+      const envelope = event.auditor_envelope as Record<string, unknown>;
+      const payload = envelope?.payload as Record<string, unknown>;
+      if (!await verifyEnvelope(envelope, auditorKey, payload)
+          || !validAuditorPayload(payload, document, event)
+          || await sha256(canonical(envelope)) !== event.artifact_envelope_sha256) {
+        throw new Error("auditor_signature_invalid");
+      }
+    }
+  }
+}
+
+function loadOwnerKeys(env: CasDependencies["env"]): Map<string, VerificationKey> {
+  const raw = env.get("B09_F4_TRUSTED_KEYS_JSON") ?? "";
+  if (!raw) throw new Error("trusted_owner_keys_missing");
+  let document: unknown;
+  try { document = JSON.parse(raw); } catch { throw new Error("trusted_owner_keys_invalid"); }
+  if (!document || typeof document !== "object" || Array.isArray(document)
+      || !exact(document as Record<string, unknown>, ["keys"])) throw new Error("trusted_owner_keys_invalid");
+  const entries = (document as { keys?: unknown }).keys;
+  if (!Array.isArray(entries) || entries.length !== 4) throw new Error("trusted_owner_keys_invalid");
+  const keys = new Map<string, VerificationKey>();
+  const roles = new Set<string>();
+  const publicKeys = new Set<string>();
+  for (const item of entries) {
+    if (!item || typeof item !== "object" || Array.isArray(item)
+        || !exact(item as Record<string, unknown>, ["key_id", "role", "public_key"])) throw new Error("trusted_owner_keys_invalid");
+    const entry = item as Record<string, unknown>;
+    if (typeof entry.key_id !== "string" || !entry.key_id || keys.has(entry.key_id)
+        || !["permit_authority", "witness", "owner_a", "owner_b"].includes(String(entry.role))
+        || roles.has(String(entry.role)) || typeof entry.public_key !== "string") throw new Error("trusted_owner_keys_invalid");
+    const publicKey = decodeBase64(entry.public_key);
+    const fingerprint = Array.from(publicKey).join(",");
+    if (publicKey.length !== 32 || publicKeys.has(fingerprint)) throw new Error("trusted_owner_keys_not_independent");
+    keys.set(entry.key_id, { key_id: entry.key_id, role: String(entry.role), public_key: publicKey });
+    roles.add(String(entry.role));
+    publicKeys.add(fingerprint);
+  }
+  return keys;
+}
+
+function loadAuditorKey(env: CasDependencies["env"], ownerKeys: Map<string, VerificationKey>): VerificationKey {
+  const raw = env.get("B09_F4_AUDITOR_KEY_JSON") ?? "";
+  if (!raw) throw new Error("trusted_auditor_key_missing");
+  let document: unknown;
+  try { document = JSON.parse(raw); } catch { throw new Error("trusted_auditor_key_invalid"); }
+  if (!document || typeof document !== "object" || Array.isArray(document)
+      || !exact(document as Record<string, unknown>, ["key_id", "role", "public_key"])) throw new Error("trusted_auditor_key_invalid");
+  const entry = document as Record<string, unknown>;
+  if (typeof entry.key_id !== "string" || !entry.key_id || entry.role !== "auditor"
+      || typeof entry.public_key !== "string" || ownerKeys.has(entry.key_id)) throw new Error("trusted_auditor_key_invalid");
+  const publicKey = decodeBase64(entry.public_key);
+  if (publicKey.length !== 32 || [...ownerKeys.values()].some((key) => constantEqualBytes(key.public_key, publicKey))) {
+    throw new Error("trusted_auditor_key_not_independent");
+  }
+  return { key_id: entry.key_id, role: "auditor", public_key: publicKey };
+}
+
+async function verifyEnvelope(envelope: Record<string, unknown>, key: VerificationKey,
+  expectedPayload: Record<string, unknown>): Promise<boolean> {
+  if (!envelope || !exact(envelope, ["key_id", "signature", "payload"])
+      || envelope.key_id !== key.key_id || canonical(envelope.payload) !== canonical(expectedPayload)
+      || typeof envelope.signature !== "string") return false;
+  try {
+    const signature = decodeBase64(envelope.signature);
+    if (signature.length !== 64) return false;
+    const cryptoKey = await crypto.subtle.importKey("raw", key.public_key, { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "Ed25519" }, cryptoKey, signature, encoder.encode(canonical(expectedPayload)));
+  } catch { return false; }
+}
+
+function validAuditorPayload(payload: Record<string, unknown>, document: Record<string, unknown>, event: Record<string, unknown>): boolean {
+  const now = Date.now();
+  const issued = Date.parse(String(payload.issued_at ?? ""));
+  const expires = Date.parse(String(payload.expires_at ?? ""));
+  return exact(payload, auditPayloadFields) && payload.schema === 1 && payload.kind === "F4_CYCLE_AUDIT"
+    && payload.repository_id === REPOSITORY_ID && payload.approval_id === document.approval_id
+    && payload.go_sha256 === document.go_sha256 && payload.base_sha === document.base_sha
+    && payload.cycle_number === 1 && payload.result === "PASS"
+    && payload.worker_run_id === event.worker_run_id && payload.auditor_run_id === event.auditor_run_id
+    && payload.workflow_run_id === event.workflow_run_id && payload.run_attempt === event.run_attempt
+    && payload.source_commit_sha === event.source_commit_sha && payload.workflow_path === AUDIT_WORKFLOW_PATH
+    && payload.pr_number === 1 && payload.pr_state === "open" && payload.pr_is_draft === true
+    && payload.pr_merged === false && payload.pr_base_sha === document.base_sha
+    && payload.readonly_ci_conclusion === "success"
+    && typeof payload.pr_head_sha === "string" && gitPattern.test(payload.pr_head_sha)
+    && typeof payload.readonly_ci_run_id === "string" && /^\d+$/.test(payload.readonly_ci_run_id)
+    && typeof payload.candidate_digest === "string" && shaPattern.test(payload.candidate_digest)
+    && typeof payload.witness_digest === "string" && shaPattern.test(payload.witness_digest)
+    && typeof payload.journal_head_sha256 === "string" && shaPattern.test(payload.journal_head_sha256)
+    && Number.isSafeInteger(payload.journal_revision) && Number(payload.journal_revision) > 0
+    && Number.isFinite(issued) && Number.isFinite(expires) && issued <= now && now < expires;
+}
+
+function decodeBase64(value: string): Uint8Array {
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) throw new Error("base64_invalid");
+  const bytes = Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+  if (btoa(String.fromCharCode(...bytes)) !== value) throw new Error("base64_invalid");
+  return bytes;
+}
+
+function constantEqualBytes(left: Uint8Array, right: Uint8Array): boolean {
+  let diff = left.length ^ right.length;
+  for (let i = 0; i < Math.max(left.length, right.length); i++) diff |= (left[i] ?? 0) ^ (right[i] ?? 0);
+  return diff === 0;
 }
 
 async function readBounded(request: Request, limit: number): Promise<Uint8Array> {

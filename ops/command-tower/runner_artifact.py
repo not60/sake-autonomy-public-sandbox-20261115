@@ -140,11 +140,6 @@ def build_artifact(*, worktree_root: str | Path, output_root: str | Path,
         (output / "manifest.json").write_text(
             json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8",
         )
-        (output / "permit.json").write_text('{"state":"NOT_ISSUED"}\n', encoding="utf-8")
-        (output / "witness.json").write_text('{"state":"NOT_ISSUED"}\n', encoding="utf-8")
-        (output / "owner-approvals.json").write_text(
-            '{"state":"NOT_APPROVED"}\n', encoding="utf-8",
-        )
     except OSError:
         raise ArtifactBuildHold("artifact_output_failed") from None
     return manifest

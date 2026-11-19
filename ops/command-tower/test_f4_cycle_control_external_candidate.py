@@ -62,6 +62,8 @@ class F4ExternalCandidateTests(unittest.TestCase):
 
     def test_workflow_cross_run_artifact_path_is_pinned_and_jobs_remain_hard_disabled(self) -> None:
         source = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("options: ['worker', 'publish-audit']", source)
+        self.assertNotRegex(source, r"(?m)^  workflow_run:")
         self.assertIn("cycle1_auditor_run_id:", source)
         self.assertIn("name: b09-f4-cycle1-auditor-evidence", source)
         self.assertIn("run-id: ${{ inputs.cycle1_auditor_run_id }}", source)

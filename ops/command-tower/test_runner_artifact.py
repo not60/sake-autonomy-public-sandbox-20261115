@@ -63,7 +63,9 @@ class RunnerArtifactTests(unittest.TestCase):
         self.assertFalse((output / "files" / PATH_B).exists())
         self.assertEqual((output / "evidence/codex-output.bin").read_bytes(),
                          self.output_file.read_bytes())
-        self.assertEqual(json.loads((output / "permit.json").read_text())["state"], "NOT_ISSUED")
+        self.assertFalse((output / "permit.json").exists())
+        self.assertFalse((output / "witness.json").exists())
+        self.assertFalse((output / "owner-approvals.json").exists())
 
     def test_disallowed_untracked_change_holds(self) -> None:
         outside = "ops/command-tower/unapproved.py"

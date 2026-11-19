@@ -65,6 +65,7 @@ def execute(*, operation: str, workspace: str | Path, expected_base_sha: str,
             env: Mapping[str, str] | None = None, cycle: int | None = None,
             run_id: str | None = None, source_commit_sha: str | None = None,
             auditor_artifact_path: str | Path | None = None,
+            cycle1_auditor_run_id: str | None = None,
             provenance_reader: object = None) -> int:
     if operation not in _ROLE_TOKEN:
         raise F4RuntimeHold("operation_invalid")
@@ -126,9 +127,13 @@ def execute(*, operation: str, workspace: str | Path, expected_base_sha: str,
         else:
             if cycle != 2 or not run_id or not source_commit_sha or not _GIT_SHA.fullmatch(source_commit_sha):
                 raise F4RuntimeHold("cycle2_claim_inputs_invalid")
-            if auditor_artifact_path is None:
+            if (auditor_artifact_path is None or not isinstance(cycle1_auditor_run_id, str)
+                    or not cycle1_auditor_run_id.isdigit()):
                 raise F4RuntimeHold("cycle1_auditor_artifact_required")
             artifact = _read_json(auditor_artifact_path)
+            payload = artifact.get("payload") if isinstance(artifact, dict) else None
+            if not isinstance(payload, dict) or payload.get("workflow_run_id") != cycle1_auditor_run_id:
+                raise F4RuntimeHold("cycle1_auditor_run_id_mismatch")
             reader = provenance_reader or _provenance(values, allow_in_progress=False)
             state = journal.claim_cycle(
                 candidate=candidate, go=go, cycle_number=2, run_id=run_id,
@@ -165,6 +170,7 @@ def main() -> int:
     parser.add_argument("--run-id")
     parser.add_argument("--source-commit-sha")
     parser.add_argument("--auditor-artifact")
+    parser.add_argument("--cycle1-auditor-run-id")
     args = parser.parse_args()
     try:
         return execute(
@@ -174,6 +180,7 @@ def main() -> int:
             auditor_key_path=args.auditor_key, cycle=args.cycle, run_id=args.run_id,
             source_commit_sha=args.source_commit_sha,
             auditor_artifact_path=args.auditor_artifact,
+            cycle1_auditor_run_id=args.cycle1_auditor_run_id,
         )
     except F4RuntimeHold as exc:
         print("HOLD:" + str(exc))

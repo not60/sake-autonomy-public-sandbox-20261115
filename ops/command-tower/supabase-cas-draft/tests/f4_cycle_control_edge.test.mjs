@@ -7,6 +7,21 @@ const names = [
   "B09_F4_TEST_CONTROL_OWNER_BEARER", "B09_F4_TEST_CONTROL_WORKER_BEARER", "B09_F4_TEST_CONTROL_AUDITOR_BEARER", "B09_F4_TEST_CONTROL_READ_BEARER",
 ];
 const envValues = Object.fromEntries(names.map((name, i) => [name, `fixture-f4-control-role-${i}-long-unique-token` ]));
+const b64 = (value) => btoa(String.fromCharCode(...new Uint8Array(value)));
+const signingKeys = {};
+for (const role of ["permit_authority", "witness", "owner_a", "owner_b", "auditor"]) {
+  signingKeys[role] = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+}
+const ownerKeyDocument = { keys: await Promise.all(["permit_authority", "witness", "owner_a", "owner_b"].map(async (role) => ({
+  key_id: `${role}-key`, role,
+  public_key: b64(await crypto.subtle.exportKey("raw", signingKeys[role].publicKey)),
+}))) };
+const auditorKeyDocument = {
+  key_id: "auditor-key", role: "auditor",
+  public_key: b64(await crypto.subtle.exportKey("raw", signingKeys.auditor.publicKey)),
+};
+envValues.B09_F4_TRUSTED_KEYS_JSON = JSON.stringify(ownerKeyDocument);
+envValues.B09_F4_AUDITOR_KEY_JSON = JSON.stringify(auditorKeyDocument);
 class Store {
   values = new Map();
   async read(key) { return this.values.get(key); }
@@ -26,20 +41,50 @@ function request(method, name, key = F4_CONTROL_KEY, options = {}) {
   return new Request(`https://fixture.invalid/functions/v1/sake-cas-v1/${key}`, { method, headers: { ...auth(name), ...(options.headers ?? {}) }, body: options.body });
 }
 async function initialDocument() {
-  const statusPayload = { schema: 1, kind: "F4_REVOCATION_STATUS", repository_id: 1458303357, approval_id: "f4-fixture", go_sha256: "a".repeat(64), sequence: 1, status: "ACTIVE", valid_from: "2026-11-19T00:00:00Z", valid_until: "2026-11-19T01:00:00Z" };
+  const statusPayload = { schema: 1, kind: "F4_REVOCATION_STATUS", repository_id: 1458303357, approval_id: "f4-fixture", go_sha256: "a".repeat(64), sequence: 1, status: "ACTIVE", valid_from: new Date(Date.now() - 60_000).toISOString(), valid_until: new Date(Date.now() + 60 * 60_000).toISOString() };
   const status = { payload: statusPayload, approvals: {
-    owner_a: { key_id: "owner-a-fixture", signature: "x".repeat(86) + "==", payload: statusPayload },
-    owner_b: { key_id: "owner-b-fixture", signature: "y".repeat(86) + "==", payload: statusPayload },
+    owner_a: await sign("owner_a", statusPayload),
+    owner_b: await sign("owner_b", statusPayload),
   } };
   const eventBody = { sequence: 1, previous_sha256: "0".repeat(64), payload: { event: "CONTROL_CREATED", revocation_status: status } };
   const digest = await hash(eventBody);
   return { schema: 1, repository_id: 1458303357, approval_id: "f4-fixture", go_sha256: "a".repeat(64), base_sha: "b".repeat(40), go_revocation_sequence: 1, revocation_sequence: 1, sequence: 1, head_sha256: digest, events: [{ ...eventBody, event_sha256: digest }] };
+}
+async function sign(role, payload) {
+  const signature = await crypto.subtle.sign({ name: "Ed25519" }, signingKeys[role].privateKey, new TextEncoder().encode(canonical(payload)));
+  return { key_id: `${role}-key`, signature: b64(signature), payload };
 }
 async function append(document, payload) {
   const body = { sequence: document.sequence + 1, previous_sha256: document.head_sha256, payload };
   const digest = await hash(body);
   const events = [...document.events, { ...body, event_sha256: digest }];
   return { ...document, sequence: events.length, head_sha256: digest, events };
+}
+async function rehashDocument(document) {
+  let previous = "0".repeat(64);
+  const events = [];
+  for (const original of document.events) {
+    const body = { sequence: events.length + 1, previous_sha256: previous, payload: original.payload };
+    const digest = await hash(body);
+    events.push({ ...body, event_sha256: digest });
+    previous = digest;
+  }
+  return { ...document, events, sequence: events.length, head_sha256: previous,
+    revocation_sequence: document.go_revocation_sequence };
+}
+function auditPayload(document) {
+  return {
+    schema: 1, kind: "F4_CYCLE_AUDIT", repository_id: 1458303357,
+    approval_id: document.approval_id, go_sha256: document.go_sha256, cycle_number: 1,
+    worker_run_id: "run-1", auditor_run_id: "auditor-1", workflow_run_id: "12345", run_attempt: 1,
+    workflow_path: ".github/workflows/public-runner-draft.yml", source_commit_sha: "d".repeat(40),
+    base_sha: document.base_sha, pr_number: 1, pr_state: "open", pr_is_draft: true, pr_merged: false,
+    pr_head_sha: "e".repeat(40), pr_base_sha: document.base_sha, readonly_ci_run_id: "98765",
+    readonly_ci_conclusion: "success", permit_id: "permit-1", candidate_digest: "a".repeat(64),
+    witness_digest: "c".repeat(64), journal_revision: 2, journal_head_sha256: "d".repeat(64),
+    result: "PASS", issued_at: new Date(Date.now() - 1000).toISOString(),
+    expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+  };
 }
 
 test("fixed control keys, independent credentials, and role transitions fail closed", async () => {
@@ -55,7 +100,8 @@ test("fixed control keys, independent credentials, and role transitions fail clo
   assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_WORKER_BEARER", F4_CONTROL_KEY, { headers, body: JSON.stringify(claim) }), deps)).status, 204);
   const cycle2 = await append(claim, { event: "CYCLE_CLAIMED", cycle_number: 2, run_id: "run-2", go_sha256: created.go_sha256, revocation_sequence: 1, revocation_digest: "c".repeat(64), claimed_at: "2026-11-19T00:00:00Z", source_commit_sha: "e".repeat(40) });
   assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_WORKER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"2"' }, body: JSON.stringify(cycle2) }), deps)).status, 409);
-  const audit = await append(claim, { event: "CYCLE1_AUDITOR_PASS", artifact_envelope_sha256: "f".repeat(64), artifact_id: 17, artifact_archive_digest: "sha256:" + "1".repeat(64), workflow_run_id: "12345", run_attempt: 1, worker_run_id: "run-1", auditor_run_id: "auditor-1", source_commit_sha: "d".repeat(40) });
+  const auditorEnvelope = await sign("auditor", auditPayload(created));
+  const audit = await append(claim, { event: "CYCLE1_AUDITOR_PASS", artifact_envelope_sha256: await hash(auditorEnvelope), artifact_id: 17, artifact_archive_digest: "sha256:" + "1".repeat(64), workflow_run_id: "12345", run_attempt: 1, worker_run_id: "run-1", auditor_run_id: "auditor-1", source_commit_sha: "d".repeat(40), auditor_envelope: auditorEnvelope });
   assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_AUDITOR_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"2"' }, body: JSON.stringify(audit) }), deps)).status, 204);
   const cycle2AfterAudit = await append(audit, cycle2.events[2].payload);
   assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_WORKER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"3"' }, body: JSON.stringify(cycle2AfterAudit) }), deps)).status, 204);
@@ -70,4 +116,38 @@ test("duplicate credentials and corrupted journal read fail closed", async () =>
   const value = store.values.get(F4_CONTROL_KEY);
   store.values.set(F4_CONTROL_KEY, { ...value, body: value.body.replace("f4-fixture", "tampered") });
   assert.equal((await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_READ_BEARER"), deps)).status, 503);
+});
+
+test("direct HTTP rejects forged Owner signatures even when the journal hash chain is recomputed", async () => {
+  const isolatedStore = new Store();
+  const isolatedDeps = { env: { get: (name) => envValues[name] }, store: isolatedStore };
+  const forged = await initialDocument();
+  forged.events[0].payload.revocation_status.approvals.owner_a.signature = b64(new Uint8Array(64));
+  const rehashed = await rehashDocument(forged);
+  const result = await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_OWNER_BEARER", F4_CONTROL_KEY, {
+    headers: { "content-type": "application/json", "if-none-match": "*" }, body: JSON.stringify(rehashed),
+  }), isolatedDeps);
+  assert.equal(result.status, 409);
+  assert.equal(isolatedStore.values.has(F4_CONTROL_KEY), false);
+});
+
+test("direct HTTP rejects a forged independent Auditor signature before Cycle 2 can claim", async () => {
+  const isolatedStore = new Store();
+  const isolatedDeps = { env: { get: (name) => envValues[name] }, store: isolatedStore };
+  const created = await initialDocument();
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_OWNER_BEARER", F4_CONTROL_KEY, {
+    headers: { "content-type": "application/json", "if-none-match": "*" }, body: JSON.stringify(created),
+  }), isolatedDeps)).status, 204);
+  const claim = await append(created, { event: "CYCLE_CLAIMED", cycle_number: 1, run_id: "run-1", go_sha256: created.go_sha256, revocation_sequence: 1, revocation_digest: "c".repeat(64), claimed_at: new Date().toISOString(), source_commit_sha: "d".repeat(40) });
+  assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_WORKER_BEARER", F4_CONTROL_KEY, {
+    headers: { "content-type": "application/json", "if-match": '"1"' }, body: JSON.stringify(claim),
+  }), isolatedDeps)).status, 204);
+  const envelope = await sign("auditor", auditPayload(created));
+  envelope.signature = b64(new Uint8Array(64));
+  const audit = await append(claim, { event: "CYCLE1_AUDITOR_PASS", artifact_envelope_sha256: await hash(envelope), artifact_id: 17, artifact_archive_digest: "sha256:" + "1".repeat(64), workflow_run_id: "12345", run_attempt: 1, worker_run_id: "run-1", auditor_run_id: "auditor-1", source_commit_sha: "d".repeat(40), auditor_envelope: envelope });
+  const result = await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_AUDITOR_BEARER", F4_CONTROL_KEY, {
+    headers: { "content-type": "application/json", "if-match": '"2"' }, body: JSON.stringify(audit),
+  }), isolatedDeps);
+  assert.equal(result.status, 409);
+  assert.equal(isolatedStore.values.get(F4_CONTROL_KEY).revision, 2);
 });

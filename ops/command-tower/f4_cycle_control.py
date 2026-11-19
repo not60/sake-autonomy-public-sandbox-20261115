@@ -60,7 +60,7 @@ _EVENT_FIELDS = {
     "CYCLE1_AUDITOR_PASS": {
         "event", "artifact_envelope_sha256", "artifact_id",
         "artifact_archive_digest", "workflow_run_id", "run_attempt",
-        "worker_run_id", "auditor_run_id", "source_commit_sha",
+        "worker_run_id", "auditor_run_id", "source_commit_sha", "auditor_envelope",
     },
 }
 
@@ -242,6 +242,7 @@ class F4CycleControlJournal:
             "worker_run_id": payload["worker_run_id"],
             "auditor_run_id": payload["auditor_run_id"],
             "source_commit_sha": payload["source_commit_sha"],
+            "auditor_envelope": artifact,
         }
         return self._append(state, current, event)
 

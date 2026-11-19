@@ -41,6 +41,26 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         self.assertNotIn("allow-users:", codex_step)
         self.assertIn("output-file: ${{ runner.temp }}/codex-final-message.txt", codex_step)
 
+    def test_finite_stages_are_explicit_cross_run_handoffs_and_not_self_triggered(self):
+        source = DRAFT_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("execution_stage:", source)
+        self.assertIn("options: ['worker', 'publish-audit']", source)
+        self.assertIn("worker_run_id:", source)
+        self.assertNotRegex(source, r"(?m)^  workflow_run:")
+        self.assertNotRegex(source, r"(?m)^  push:")
+        self.assertIn("if: ${{ false && github.ref == 'refs/heads/main' && inputs.execution_stage == 'worker' }}", source)
+        expected_publish_if = "if: ${{ false && github.ref == 'refs/heads/main' && inputs.execution_stage == 'publish-audit' }}"
+        self.assertIn(expected_publish_if, section(source, "publisher", "auditor"))
+        self.assertIn(expected_publish_if, section(source, "auditor", None))
+        publisher = section(source, "publisher", "auditor")
+        auditor = section(source, "auditor", None)
+        self.assertNotRegex(publisher, r"(?m)^    needs:")
+        self.assertIn("run-id: ${{ inputs.worker_run_id }}", publisher)
+        self.assertIn("run-id: ${{ inputs.publisher_attestation_run_id }}", publisher)
+        self.assertIn("run-id: ${{ inputs.worker_run_id }}", auditor)
+        self.assertIn("needs: [publisher]", auditor)
+        self.assertIn("F4_CYCLE2_AUDITOR_COMPLETE_SAFE_STOP", auditor)
+
     def test_worker_packages_actual_delta_and_binds_codex_output(self) -> None:
         source = DRAFT_WORKFLOW.read_text(encoding="utf-8")
         package = source.split("      - name: Package exact candidate bytes and hash manifest\n", 1)[1]
@@ -67,7 +87,7 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
     def test_publisher_writer_is_connected_but_remains_hard_disabled(self) -> None:
         source = DRAFT_WORKFLOW.read_text(encoding="utf-8")
         publisher = section(source, "publisher", "auditor")
-        self.assertIn("if: ${{ false && needs.worker.result == 'success' }}", publisher)
+        self.assertIn("if: ${{ false && github.ref == 'refs/heads/main' && inputs.execution_stage == 'publish-audit' }}", publisher)
         self.assertIn("B09_PUBLISHER_GITHUB_TOKEN: ${{ secrets.B09_PUBLISHER_GITHUB_TOKEN }}", publisher)
         self.assertIn("--draft-pr-write", publisher)
         self.assertIn("pr_head_sha: ${{ steps.publish.outputs.pr_head_sha }}", publisher)

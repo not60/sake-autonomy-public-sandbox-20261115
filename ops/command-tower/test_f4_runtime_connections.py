@@ -200,7 +200,10 @@ class F4RuntimeConnectionTests(unittest.TestCase):
                 "revocation.json": self.revocation,
                 "trusted.json": self.key_document,
                 "auditor.json": self.auditor_document,
-                "auditor-envelope.json": {"key_id": "auditor-fixture", "signature": "test", "payload": {}},
+                "auditor-envelope.json": {
+                    "key_id": "auditor-fixture", "signature": "test",
+                    "payload": {"workflow_run_id": "99"},
+                },
             }
             for name, value in values.items():
                 (folder / name).write_text(json.dumps(value))
@@ -223,13 +226,26 @@ class F4RuntimeConnectionTests(unittest.TestCase):
                         candidate_path=folder / "candidate.json", revocation_path=folder / "revocation.json",
                         trusted_keys_path=folder / "trusted.json", auditor_key_path=folder / "auditor.json",
                         env=env, cycle=2, run_id="100-1", source_commit_sha="b" * 40,
-                        auditor_artifact_path=folder / "auditor-envelope.json", provenance_reader=reader,
+                        auditor_artifact_path=folder / "auditor-envelope.json",
+                        cycle1_auditor_run_id="99", provenance_reader=reader,
                     )
                 self.assertEqual(result, 0)
                 backend.assert_called_once_with(endpoint=f4_cycle_runtime.CAS_ENDPOINT, bearer_token="w" * 40)
                 journal.claim_cycle.assert_called_once()
                 self.assertIs(journal.claim_cycle.call_args.kwargs["verify_github_artifact"], reader)
                 self.assertIn("F4_CYCLE_CONTROL_OK:claim-cycle2:4", out.getvalue())
+
+                journal.claim_cycle.reset_mock()
+                with self.assertRaisesRegex(f4_cycle_runtime.F4RuntimeHold, "cycle1_auditor_run_id_mismatch"):
+                    f4_cycle_runtime.execute(
+                        operation="claim-cycle2", workspace=ROOT, expected_base_sha=BASE,
+                        candidate_path=folder / "candidate.json", revocation_path=folder / "revocation.json",
+                        trusted_keys_path=folder / "trusted.json", auditor_key_path=folder / "auditor.json",
+                        env=env, cycle=2, run_id="101-1", source_commit_sha="c" * 40,
+                        auditor_artifact_path=folder / "auditor-envelope.json",
+                        cycle1_auditor_run_id="100", provenance_reader=reader,
+                    )
+                journal.claim_cycle.assert_not_called()
 
             with self.assertRaises(f4_cycle_runtime.F4RuntimeHold):
                 f4_cycle_runtime.execute(
@@ -244,6 +260,9 @@ class F4RuntimeConnectionTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/public-runner-draft.yml").read_text(encoding="utf-8")
         self.assertIn("B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}", workflow)
         self.assertIn("B09_F4_AUDITOR_KEY_JSON: ${{ vars.B09_F4_AUDITOR_KEY_JSON }}", workflow)
+        self.assertIn("name: b09-public-runner-signed-attestations", workflow)
+        self.assertIn('"$RUNNER_TEMP/b09-signed-attestations/permit.json"', workflow)
+        self.assertNotIn('{"keys":[]}', workflow)
         self.assertIn("root = Path(os.environ[\"RUNNER_TEMP\"]) / \"b09-f4-trust\"", workflow)
         self.assertIn("required=(candidate.json revocation-envelope.json)", workflow)
         self.assertNotIn("required=(candidate.json revocation-envelope.json trusted-keys.json auditor-key.json)", workflow)

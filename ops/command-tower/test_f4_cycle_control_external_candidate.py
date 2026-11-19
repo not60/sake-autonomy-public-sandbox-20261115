@@ -13,6 +13,78 @@ WORKFLOW = ROOT / ".github/workflows/public-runner-draft.yml"
 
 
 class F4ExternalCandidateTests(unittest.TestCase):
+    @staticmethod
+    def _fixture_membership_guard(memberships, effective):
+        expected = {
+            "granted_role": "sake_b09_cas_edge",
+            "member_role": "postgres",
+            "grantor_role": "supabase_admin",
+            "admin_option": True,
+            "inherit_option": False,
+            "set_option": False,
+        }
+        return (
+            memberships == [expected]
+            and effective == {
+                "postgres_edge_usage": False,
+                "postgres_edge_set": False,
+                "edge_postgres_member": False,
+            }
+        )
+
+    def test_migration_accepts_only_the_exact_admin_membership_fixture(self) -> None:
+        migration = MIGRATION.read_text(encoding="utf-8")
+        self.assertIn("edge_membership_count <> 1", migration)
+        self.assertIn("m.roleid = edge_role_oid AND m.member = postgres_role_oid", migration)
+        self.assertIn("m.grantor = admin_role_oid", migration)
+        self.assertIn("m.admin_option IS TRUE", migration)
+        self.assertIn("m.inherit_option IS FALSE", migration)
+        self.assertIn("m.set_option IS FALSE", migration)
+        self.assertIn("pg_has_role('postgres', 'sake_b09_cas_edge', 'USAGE') IS DISTINCT FROM FALSE", migration)
+        self.assertIn("pg_has_role('postgres', 'sake_b09_cas_edge', 'SET') IS DISTINCT FROM FALSE", migration)
+        self.assertIn("pg_has_role('sake_b09_cas_edge', 'postgres', 'MEMBER') IS DISTINCT FROM FALSE", migration)
+        self.assertIn("ADMIN OPTION intentionally leaves them able to manage this membership later", migration)
+
+        exact = [{
+            "granted_role": "sake_b09_cas_edge",
+            "member_role": "postgres",
+            "grantor_role": "supabase_admin",
+            "admin_option": True,
+            "inherit_option": False,
+            "set_option": False,
+        }]
+        effective = {
+            "postgres_edge_usage": False,
+            "postgres_edge_set": False,
+            "edge_postgres_member": False,
+        }
+        self.assertTrue(self._fixture_membership_guard(exact, effective))
+
+        mutations = {
+            "additional membership": exact + [{**exact[0], "member_role": "other_role"}],
+            "reverse membership": [{**exact[0], "granted_role": "postgres", "member_role": "sake_b09_cas_edge"}],
+            "grantor mismatch": [{**exact[0], "grantor_role": "other_admin"}],
+            "ADMIN mismatch": [{**exact[0], "admin_option": False}],
+            "ADMIN unknown": [{**exact[0], "admin_option": None}],
+            "INHERIT mismatch": [{**exact[0], "inherit_option": True}],
+            "INHERIT unknown": [{**exact[0], "inherit_option": None}],
+            "SET mismatch": [{**exact[0], "set_option": True}],
+            "SET unknown": [{**exact[0], "set_option": None}],
+        }
+        for label, candidate in mutations.items():
+            with self.subTest(case=label):
+                self.assertFalse(self._fixture_membership_guard(candidate, effective))
+
+        for key in effective:
+            with self.subTest(case=f"effective privilege {key}"):
+                self.assertFalse(
+                    self._fixture_membership_guard(exact, {**effective, key: True})
+                )
+        with self.subTest(case="unknown effective privilege"):
+            self.assertFalse(
+                self._fixture_membership_guard(exact, {**effective, "postgres_edge_set": None})
+            )
+
     def test_migration_is_transactional_fixed_key_only_and_non_destructive(self) -> None:
         sql = MIGRATION.read_text(encoding="utf-8")
         self.assertTrue(sql.startswith("-- LOCAL DRAFT ONLY"))

@@ -8,20 +8,44 @@ DECLARE
   existing_policy_count integer;
   exact_policy_count integer;
   fixed_key_check_count integer;
+  edge_role_oid oid;
+  postgres_role_oid oid;
+  admin_role_oid oid;
+  edge_membership_count integer;
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_catalog.pg_roles
-    WHERE rolname = 'sake_b09_cas_edge' AND rolcanlogin
-      AND NOT rolsuper AND NOT rolinherit AND NOT rolbypassrls
-      AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication
-  ) OR EXISTS (
-    SELECT 1 FROM pg_catalog.pg_auth_members m
-    WHERE m.member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'sake_b09_cas_edge')
-  ) OR EXISTS (
-    SELECT 1 FROM pg_catalog.pg_auth_members m
-    WHERE m.roleid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'sake_b09_cas_edge')
-  ) THEN
+  SELECT oid INTO edge_role_oid FROM pg_catalog.pg_roles WHERE rolname = 'sake_b09_cas_edge';
+  SELECT oid INTO postgres_role_oid FROM pg_catalog.pg_roles WHERE rolname = 'postgres';
+  SELECT oid INTO admin_role_oid FROM pg_catalog.pg_roles WHERE rolname = 'supabase_admin';
+
+  IF edge_role_oid IS NULL OR postgres_role_oid IS NULL OR admin_role_oid IS NULL
+     OR NOT EXISTS (
+       SELECT 1 FROM pg_catalog.pg_roles
+       WHERE oid = edge_role_oid AND rolcanlogin
+         AND NOT rolsuper AND NOT rolinherit AND NOT rolbypassrls
+         AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication
+     ) THEN
     RAISE EXCEPTION 'F4 migration requires the existing isolated CAS login role';
+  END IF;
+
+  -- The former zero-membership precondition is narrowed to one verified
+  -- administrative edge only: postgres is the member of the Edge role,
+  -- granted by supabase_admin with ADMIN OPTION but neither INHERIT nor SET.
+  -- postgres/supabase_admin remain inside the trusted administrator boundary;
+  -- ADMIN OPTION intentionally leaves them able to manage this membership later.
+  SELECT count(*) INTO edge_membership_count
+  FROM pg_catalog.pg_auth_members m
+  WHERE m.roleid = edge_role_oid OR m.member = edge_role_oid;
+  IF edge_membership_count <> 1 OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_auth_members m
+    WHERE m.roleid = edge_role_oid AND m.member = postgres_role_oid
+      AND m.grantor = admin_role_oid
+      AND m.admin_option IS TRUE
+      AND m.inherit_option IS FALSE
+      AND m.set_option IS FALSE
+  ) OR pg_catalog.pg_has_role('postgres', 'sake_b09_cas_edge', 'USAGE') IS DISTINCT FROM FALSE
+    OR pg_catalog.pg_has_role('postgres', 'sake_b09_cas_edge', 'SET') IS DISTINCT FROM FALSE
+    OR pg_catalog.pg_has_role('sake_b09_cas_edge', 'postgres', 'MEMBER') IS DISTINCT FROM FALSE THEN
+    RAISE EXCEPTION 'F4 migration requires the exact isolated CAS administrator membership';
   END IF;
 
   IF NOT EXISTS (

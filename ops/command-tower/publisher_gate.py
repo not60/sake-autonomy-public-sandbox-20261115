@@ -462,6 +462,19 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _write_f4_audit_evidence(path: str | Path, evidence: Mapping[str, object]) -> None:
+    target = Path(path)
+    if target.exists() or target.is_symlink():
+        raise PublisherGateHold("f4_audit_evidence_output_exists")
+    encoded = (json.dumps(dict(evidence), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def main(argv: list[str] | None = None) -> int:
     """Verify a bundle and prepare a local PR plan; never calls GitHub."""
     parser = argparse.ArgumentParser(description="Verify a DRAFT_HOLD Publisher artifact")
@@ -489,6 +502,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="required pinned PR head for read-only CI evidence")
     parser.add_argument("--expected-pr-base-sha", default="",
                         help="required pinned PR base for read-only CI evidence")
+    parser.add_argument("--f4-audit-evidence-output", default="",
+                        help="write read-only structured evidence after the exact PR/CI audit passes")
     args = parser.parse_args(argv)
     from draft_pr_writer import DraftPrWriter, GitHubDraftPrApi, WriterHold
 
@@ -512,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
             raise PublisherGateHold("draft_pr_expected_head_invalid")
         if not args.draft_pr_write and args.expected_head_sha:
             raise PublisherGateHold("expected_head_without_write_request")
+        if args.f4_audit_evidence_output and not (args.role == "auditor" and args.audit_pr_ci):
+            raise PublisherGateHold("f4_audit_evidence_requires_auditor_ci_pass")
         token_name = "B09_CAS_TOKEN" if args.role == "publisher" else "B09_CAS_READ_TOKEN"
         token = os.environ.get(token_name, "")
         if not args.cas_endpoint or not token:
@@ -523,13 +540,14 @@ def main(argv: list[str] | None = None) -> int:
         key_document = json.loads(Path(args.trusted_keys).read_text(encoding="utf-8"))
         keys = load_trusted_verification_keys(key_document)
         store = DurableStore(args.database)
+        journal = PermitCasJournal(
+            HttpsCasBackend(endpoint=args.cas_endpoint, bearer_token=token),
+            repository_id=args.repository_id,
+        )
         gate = PublisherGate(
             repository_id=args.repository_id, base_sha=args.base_sha,
             allowed_paths=tuple(args.allowed_path), trusted_keys=keys, durable_store=store,
-            cas_journal=PermitCasJournal(
-                HttpsCasBackend(endpoint=args.cas_endpoint, bearer_token=token),
-                repository_id=args.repository_id,
-            ),
+            cas_journal=journal,
         )
         verify = gate.verify_bundle if args.role == "publisher" else gate.audit_bundle
         result = verify(
@@ -559,11 +577,35 @@ def main(argv: list[str] | None = None) -> int:
             github_token = os.environ.get("GITHUB_TOKEN", "")
             if not github_token:
                 raise WriterHold("auditor_github_token_missing")
-            ci_result = GitHubDraftPrApi(github_token).wait_for_readonly_ci_run(
+            github_api = GitHubDraftPrApi(github_token)
+            ci_result = github_api.wait_for_readonly_ci_run(
                 args.pull_request_number, args.expected_pr_head_sha, args.expected_pr_base_sha,
             )
             if ci_result.status != "completed" or ci_result.conclusion != "success":
                 raise WriterHold("readonly_ci_not_success")
+            if args.f4_audit_evidence_output:
+                pr = github_api.get_open_draft_pull_request(
+                    PUBLIC_REPOSITORY_ID, PUBLIC_HEAD_BRANCH, PUBLIC_BASE_BRANCH,
+                )
+                snapshot = journal.snapshot()
+                if (pr.number != args.pull_request_number
+                        or pr.head_sha != args.expected_pr_head_sha
+                        or pr.base_sha != args.expected_pr_base_sha
+                        or pr.draft is not True):
+                    raise WriterHold("f4_audit_pr_readback_mismatch")
+                _write_f4_audit_evidence(args.f4_audit_evidence_output, {
+                    "schema": 1, "repository_id": result.repository_id,
+                    "base_sha": result.base_sha, "worker_run_id": result.worker_run_id,
+                    "candidate_digest": result.candidate_digest, "permit_id": result.permit_id,
+                    "witness_digest": result.witness_digest,
+                    "journal_revision": snapshot.sequence,
+                    "journal_head_sha256": snapshot.head_sha256,
+                    "pr_number": pr.number, "pr_state": "open",
+                    "pr_is_draft": True, "pr_merged": False,
+                    "pr_head_sha": pr.head_sha, "pr_base_sha": pr.base_sha,
+                    "readonly_ci_run_id": str(ci_result.run_id),
+                    "readonly_ci_conclusion": ci_result.conclusion,
+                })
     except WriterHold as exc:
         print(f"HOLD:{exc.reason}", file=sys.stderr)
         return 2

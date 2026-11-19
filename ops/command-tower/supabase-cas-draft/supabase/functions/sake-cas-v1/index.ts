@@ -6,8 +6,10 @@ import {
   type CasStore,
   type CasStoredDocument,
 } from "./core.ts";
+import { F4_CONTROL_KEY, F4_CONTROL_TEST_KEY, handleF4ControlRequest } from "./cycle_control.ts";
 
-const CAS_KEYS = new Set([CAS_KEY, CAS_TEST_KEY]);
+const F4_CONTROL_KEYS = new Set([F4_CONTROL_KEY, F4_CONTROL_TEST_KEY]);
+const CAS_KEYS = new Set([CAS_KEY, CAS_TEST_KEY, ...F4_CONTROL_KEYS]);
 
 class PostgresCasStore implements CasStore {
   constructor(private readonly connectionString: string) {}
@@ -72,4 +74,12 @@ const env = { get: (name: string) => Deno.env.get(name) };
 const databaseUrl = Deno.env.get("B09_CAS_DB_URL") ?? "";
 const store = databaseUrl ? new PostgresCasStore(databaseUrl) : null;
 
-Deno.serve((request) => handleCasRequest(request, { env, store }));
+Deno.serve((request) => {
+  const path = new URL(request.url).pathname;
+  const isF4ControlPath = [...F4_CONTROL_KEYS].some((key) =>
+    path === "/functions/v1/sake-cas-v1/" + key || path === "/" + key
+  );
+  return isF4ControlPath
+    ? handleF4ControlRequest(request, { env, store })
+    : handleCasRequest(request, { env, store });
+});

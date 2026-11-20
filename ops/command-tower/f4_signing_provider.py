@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import base64
 from dataclasses import replace
+import io
+import json
+import os
 from pathlib import Path
+import stat
 import sys
 from typing import Mapping
 
-from f4_signing_cli import SigningContext, SigningCliHold, _verify_signer_binding, main
+from f4_signing_cli import (
+    SigningContext, SigningCliHold, _unique_object, _verify_signer_binding, main,
+)
 from trusted_key_registry import TrustedVerificationKey
 
 # New interfaces, not claims that any credential currently exists.
@@ -26,6 +32,96 @@ ROLE_SECRET_NAMES = {
     "owner_a_delegate": "B09_F4_DELEGATE_A_PRIVATE_KEY_PKCS8_B64",
     "owner_b_delegate": "B09_F4_DELEGATE_B_PRIVATE_KEY_PKCS8_B64",
 }
+ROLE_REQUEST_FILES = {
+    "permit_authority": "permit_authority-request.json",
+    "witness": "witness-request.json",
+    "owner_a_delegate": "owner_a_delegate-request.json",
+    "owner_b_delegate": "owner_b_delegate-request.json",
+}
+ROLE_REQUEST_FIELDS = {
+    "permit_authority": frozenset({
+        "permit_id", "issuer_id", "repository_id", "base_sha",
+        "candidate_digest", "changed_paths", "worker_run_id",
+    }),
+    "witness": frozenset({"witness_id", "permit"}),
+    "owner_a_delegate": frozenset({"delegation_envelope", "revocation_status", "evidence"}),
+    "owner_b_delegate": frozenset({"delegation_envelope", "revocation_status", "evidence"}),
+}
+
+
+def _require_independent_status_readers(*, role: str,
+                                        authenticated_execution_check,
+                                        read_authenticated_delegation_status,
+                                        read_verified_cycle1_audit_digest=None) -> None:
+    """Prevent a GO freshness check from being reused as delegation/audit state."""
+    if role not in {"owner_a_delegate", "owner_b_delegate"}:
+        return
+    if (read_authenticated_delegation_status is authenticated_execution_check
+            or (read_verified_cycle1_audit_digest is not None
+                and read_authenticated_delegation_status is read_verified_cycle1_audit_digest)):
+        raise SigningCliHold("delegation_revocation_reader_must_be_independent")
+
+
+def load_signing_request_file(*, role: str, input_root: str | Path) -> str:
+    """Read one bounded JSON request from the protected launcher's data directory.
+
+    This loader treats artifacts only as data. The existing CLI and the
+    injected verification context still validate provenance, scope, signatures,
+    CAS, and revocation before a signer can be used.
+    """
+    if role not in ROLE_REQUEST_FILES:
+        raise SigningCliHold("signing_request_role_invalid")
+    root = Path(input_root)
+    if root.is_symlink():
+        raise SigningCliHold("signing_request_root_unsafe")
+    try:
+        resolved_root = root.resolve(strict=True)
+        if not resolved_root.is_dir():
+            raise SigningCliHold("signing_request_root_unsafe")
+        target = resolved_root / ROLE_REQUEST_FILES[role]
+        target.resolve(strict=True).relative_to(resolved_root)
+        if target.is_symlink():
+            raise SigningCliHold("signing_request_file_unsafe")
+        fd = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 4 * 1024 * 1024:
+                raise SigningCliHold("signing_request_file_unsafe")
+            chunks = bytearray()
+            while len(chunks) <= 4 * 1024 * 1024:
+                part = os.read(fd, min(65536, 4 * 1024 * 1024 + 1 - len(chunks)))
+                if not part:
+                    break
+                chunks.extend(part)
+        finally:
+            os.close(fd)
+        if len(chunks) > 4 * 1024 * 1024:
+            raise SigningCliHold("signing_request_too_large")
+        raw = bytes(chunks).decode("utf-8", errors="strict")
+        request = json.loads(raw, object_pairs_hook=_unique_object)
+    except SigningCliHold:
+        raise
+    except Exception:
+        raise SigningCliHold("signing_request_file_invalid_or_unavailable") from None
+    if not isinstance(request, dict) or set(request) != ROLE_REQUEST_FIELDS[role]:
+        raise SigningCliHold("signing_request_schema_mismatch")
+    return raw
+
+
+def launch_signing_role_from_request_file(*, role: str, environment: str,
+                                          role_keys: Mapping[str, TrustedVerificationKey],
+                                          encoded_private_key: str,
+                                          input_root: str | Path, output: str | Path,
+                                          verification_inputs: Mapping[str, object]) -> int:
+    """Join a fixed request artifact to the existing trusted role launcher."""
+    if not isinstance(verification_inputs, Mapping):
+        raise SigningCliHold("trusted_verification_inputs_missing")
+    raw = load_signing_request_file(role=role, input_root=input_root)
+    return launch_signing_role(
+        role=role, environment=environment, role_keys=role_keys,
+        encoded_private_key=encoded_private_key, request=io.StringIO(raw),
+        output=output, verification_inputs=verification_inputs,
+    )
 
 
 def bind_role_context(*, role: str, environment: str,
@@ -90,6 +186,44 @@ def run_trusted_role(*, role: str, environment: str, template: SigningContext,
     return main(["--role", role], context=context, stdin=stdin, stdout=stdout, stderr=stderr)
 
 
+def build_live_go_execution_check(*, candidate, workspace, expected_base_sha,
+                                  trusted_owner_keys, cycle_control_journal):
+    """Bind the existing GO verifier to a fresh, read-only cycle-control CAS read.
+
+    This is specifically the F4 GO revocation source. It does not provide or
+    substitute for the separate delegation-revocation reader required by
+    delegate roles.
+    """
+    from f4_cycle_control import F4CycleControlJournal, _current_revocation
+    from f4_cycle_runtime import execution_authorization_check
+    if not isinstance(cycle_control_journal, F4CycleControlJournal):
+        raise SigningCliHold("trusted_cycle_control_journal_required")
+
+    def read_latest_go_revocation():
+        try:
+            state = cycle_control_journal.read()
+            if state is None:
+                raise SigningCliHold("signed_go_revocation_state_missing")
+            envelope = _current_revocation(state.events)
+            if envelope is None:
+                raise SigningCliHold("signed_go_revocation_state_missing")
+            return envelope
+        except SigningCliHold:
+            raise
+        except Exception:
+            raise SigningCliHold("signed_go_revocation_state_unavailable") from None
+
+    try:
+        return execution_authorization_check(
+            candidate=candidate, workspace=workspace,
+            expected_base_sha=expected_base_sha,
+            trusted_keys=trusted_owner_keys,
+            read_signed_revocation=read_latest_go_revocation,
+        )
+    except Exception:
+        raise SigningCliHold("signed_go_verifier_unavailable") from None
+
+
 def build_verification_context(*, role, gate, journal, artifact_root, manifest,
                                codex_output_file, expected_run_id,
                                expected_execution_sha, cycle, cycle_tasks,
@@ -101,8 +235,8 @@ def build_verification_context(*, role, gate, journal, artifact_root, manifest,
     gate/journal, source files, pinned run/scope, authenticated readers and token
     come ONLY from trusted launcher configuration. Readers must verify freshness
     and the existing signed F4/cycle-control contracts, not a supplied PASS flag.
-    Delegation revocation has no standalone signed-envelope contract today:
-    its authoritative authenticated read source remains mandatory and external.
+    DelegationStatusStore readers verify the full signed contract before adapting
+    to the existing three-field status; external deployment remains required.
     This factory never consumes a Permit or mutates CAS.
     """
     import hashlib
@@ -120,6 +254,11 @@ def build_verification_context(*, role, gate, journal, artifact_root, manifest,
             or len(set(cycle_tasks)) != 2 or type(cycle) is not int or cycle not in (1, 2)
             or (cycle == 2 and not callable(read_verified_cycle1_audit_digest))):
         raise SigningCliHold("trusted_verification_inputs_missing")
+    _require_independent_status_readers(
+        role=role, authenticated_execution_check=authenticated_execution_check,
+        read_authenticated_delegation_status=read_authenticated_delegation_status,
+        read_verified_cycle1_audit_digest=read_verified_cycle1_audit_digest,
+    )
     # Freeze JSON inputs, so caller mutation cannot change a previously bound request.
     frozen_manifest = json.loads(canonical_json(manifest))
     frozen_permit = json.loads(canonical_json(permit))
@@ -318,3 +457,16 @@ if __name__ == "__main__":
     # A secret alone must never substitute for trusted validators/provenance.
     print("HOLD:protected_launcher_verification_context_not_connected", file=sys.stderr)
     raise SystemExit(78)
+
+
+def build_delegation_status_reader(*, backend, trusted_owner_keys, environment, delegation_payload):
+    """Protected caller supplies an authenticated read-only CAS backend and scope."""
+    import hashlib
+    from attestations import canonical_json
+    from delegation_revocation import DelegationStatusStore, authenticated_delegation_reader
+    store = DelegationStatusStore(backend, trusted_owner_keys=trusted_owner_keys, environment=environment)
+    return authenticated_delegation_reader(
+        store, expected_delegation_id=delegation_payload["delegation_id"],
+        expected_contract_sha256=hashlib.sha256(canonical_json(delegation_payload)).hexdigest(),
+        expected_revision=delegation_payload["execution_revision"],
+    )

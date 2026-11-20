@@ -3,6 +3,8 @@ export const CAS_KEY = "repositories/1458303357/b09-permit-journal-v1.json";
 export const RETIRED_CAS_TEST_KEY = "repositories/1458303357/b09-permit-journal-test-v1.json";
 export const F4_CONTROL_KEY = "repositories/1458303357/b09-f4-cycle-control-v1.json";
 export const F4_CONTROL_TEST_KEY = "repositories/1458303357/b09-f4-cycle-control-test-v1.json";
+export const DELEGATION_KEY = "repositories/1458303357/b09-delegation-status-v1.json";
+export const DELEGATION_TEST_KEY = "repositories/1458303357/b09-delegation-status-test-v1.json";
 export const REPOSITORY_ID = 1458303357;
 export const MAX_DOCUMENT_BYTES = 1024 * 1024;
 export const CAS_AUTH_GENERATION = "v2";
@@ -76,7 +78,7 @@ type Journal = {
 
 export type FixedCasRoute = {
   key: string;
-  handler: "permit" | "f4-control";
+  handler: "permit" | "f4-control" | "delegation";
 };
 
 const fixedPathPrefixes = [
@@ -86,6 +88,8 @@ const fixedPathPrefixes = [
 ] as const;
 const fixedPathRoutes = new Map<string, FixedCasRoute>();
 for (const [key, handler] of [
+  [DELEGATION_KEY, "delegation"],
+  [DELEGATION_TEST_KEY, "delegation"],
   [CAS_KEY, "permit"],
   [RETIRED_CAS_TEST_KEY, "permit"],
   [F4_CONTROL_KEY, "f4-control"],
@@ -101,8 +105,12 @@ export function resolveFixedCasRoute(pathname: string): FixedCasRoute | null {
 
 export function dispatchFixedCasRequest<T>(
   pathname: string,
-  handlers: { permit: () => T; f4Control: () => T },
+  handlers: { permit: () => T; f4Control: () => T; delegation?: () => T },
 ): T {
+  if (resolveFixedCasRoute(pathname)?.handler === "delegation") {
+    if (!handlers.delegation) throw new Error("delegation_handler_missing");
+    return handlers.delegation();
+  }
   return resolveFixedCasRoute(pathname)?.handler === "f4-control"
     ? handlers.f4Control()
     : handlers.permit();

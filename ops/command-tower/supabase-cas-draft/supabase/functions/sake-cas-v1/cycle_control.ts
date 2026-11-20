@@ -108,7 +108,7 @@ export async function handleF4ControlRequest(
   }
 }
 
-function identify(auth: string | null, env: CasDependencies["env"]): { mode: ControlMode; role: ControlRole } | null {
+export function identify(auth: string | null, env: CasDependencies["env"]): { mode: ControlMode; role: ControlRole } | null {
   if (!auth?.startsWith("Bearer ")) return null;
   const allTokens = readV2RoleTokens(env);
   if (!allTokens) return null;
@@ -288,7 +288,7 @@ async function verifyStoredSignatures(document: Record<string, unknown>, env: Ca
   }
 }
 
-function loadOwnerKeys(env: CasDependencies["env"]): Map<string, VerificationKey> {
+export function loadOwnerKeys(env: CasDependencies["env"]): Map<string, VerificationKey> {
   const raw = env.get("B09_F4_TRUSTED_KEYS_JSON") ?? "";
   if (!raw) throw new Error("trusted_owner_keys_missing");
   let document: unknown;
@@ -392,14 +392,14 @@ async function readBounded(request: Request, limit: number): Promise<Uint8Array>
   const bytes = new Uint8Array(total); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
   return bytes;
 }
-function canonical(value: unknown): string {
+export function canonical(value: unknown): string {
   if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
   if (typeof value === "number") { if (!Number.isSafeInteger(value)) throw new Error("number_invalid"); return JSON.stringify(value); }
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
   if (value && typeof value === "object") return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical((value as Record<string, unknown>)[key])).join(",") + "}";
   throw new Error("json_invalid");
 }
-async function sha256(value: string): Promise<string> { const bytes = await crypto.subtle.digest("SHA-256", encoder.encode(value)); return Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join(""); }
+export async function sha256(value: string): Promise<string> { const bytes = await crypto.subtle.digest("SHA-256", encoder.encode(value)); return Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join(""); }
 function exact(value: Record<string, unknown>, keys: string[]): boolean { const actual = Object.keys(value).sort(); const expected = [...keys].sort(); return actual.length === expected.length && actual.every((key, i) => key === expected[i]); }
 function etag(revision: number): string { return `"${revision}"`; }
 function response(status: number): Response { return new Response(null, { status, headers: { "cache-control": "no-store" } }); }

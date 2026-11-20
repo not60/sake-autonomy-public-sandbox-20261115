@@ -1,5 +1,14 @@
 # DRAFT_HOLD fragment only. Not an Actions workflow; no trigger or caller.
 # Protected launcher, artifact provenance and live verifier context remain disconnected.
+# A future protected caller must materialize one request as data under its private
+# RUNNER_TEMP input directory using these exact role filenames:
+#   permit_authority: permit_authority-request.json
+#   witness: witness-request.json
+#   owner_a_delegate: owner_a_delegate-request.json
+#   owner_b_delegate: owner_b_delegate-request.json
+# The trusted provider reads only that fixed file and still runs all existing
+# provenance/CAS/signature checks. GO revocation is not a delegation-status source;
+# delegate jobs remain held until a distinct authenticated delegation reader exists.
 permissions: {}
 jobs:
   permit_authority:

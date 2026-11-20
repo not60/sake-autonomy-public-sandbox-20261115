@@ -59,6 +59,39 @@ def _load_auditor_key(document: object, owner_keys: Mapping[str, TrustedVerifica
     return key
 
 
+def execution_authorization_check(*, candidate, workspace, expected_base_sha,
+                                  trusted_keys, read_signed_revocation):
+    """Build the signing-side read-only GO/revocation check from existing contracts.
+
+    The reader is supplied by protected code and must obtain the latest status;
+    cached candidate JSON cannot establish revocation freshness.
+    """
+    from f4_cycle_control import _verify_revocation_status
+    from f4_go_gate import verified_f4_go_sha256
+    if not callable(read_signed_revocation):
+        raise F4RuntimeHold("fresh_signed_revocation_reader_missing")
+
+    def check():
+        try:
+            status = read_signed_revocation()
+            payload = status["payload"]
+            simple = {k: payload[k] for k in ("approval_id", "sequence", "status")}
+            go = verify_f4_go_candidate(
+                candidate=candidate, workspace=workspace,
+                expected_repository_id=REPOSITORY_ID, expected_base_sha=expected_base_sha,
+                trusted_keys=trusted_keys, revocation_status=simple,
+                verify_revocation_status=lambda value: value == simple,
+            )
+            verified = _verify_revocation_status(
+                status, go=go, go_sha256=verified_f4_go_sha256(candidate, go),
+                trusted_keys=trusted_keys,
+            )
+            return verified["status"] == "ACTIVE" and verified["sequence"] >= go.revocation_sequence
+        except Exception:
+            return False
+    return check
+
+
 def execute(*, operation: str, workspace: str | Path, expected_base_sha: str,
             candidate_path: str | Path, revocation_path: str | Path,
             trusted_keys_path: str | Path, auditor_key_path: str | Path,

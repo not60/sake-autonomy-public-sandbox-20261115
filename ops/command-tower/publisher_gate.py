@@ -181,9 +181,8 @@ class PublisherGate:
             self._stop("unexpected_validation_failure")
             raise PublisherGateHold("unexpected_validation_failure") from None
 
-    def _verify_bundle(self, artifact_root: str | Path, manifest: object,
-                       permit: object, witness: object, codex_output_file: str | Path,
-                       owner_approvals: object, *, consume: bool) -> OfflineVerificationResult:
+    def verify_signing_material(self, *, artifact_root, manifest, codex_output_file):
+        """Read-only reuse of the exact Publisher byte/scope checks before signing."""
         if self._store.state != "DRAFT_HOLD":
             raise PublisherGateHold("durable_runtime_not_active")
         if self._cas_journal is None:
@@ -233,6 +232,19 @@ class PublisherGate:
             raise PublisherGateHold("candidate_digest_mismatch")
         self._verify_artifact_files(artifact_root, files)
         self._verify_codex_output(codex_output_file, output_digest)
+
+        return {**material, "candidate_digest": candidate_digest}
+
+    def _verify_bundle(self, artifact_root: str | Path, manifest: object,
+                       permit: object, witness: object, codex_output_file: str | Path,
+                       owner_approvals: object, *, consume: bool) -> OfflineVerificationResult:
+        material = self.verify_signing_material(
+            artifact_root=artifact_root, manifest=manifest, codex_output_file=codex_output_file,
+        )
+        repo_id, base_sha = material["repository_id"], material["base_sha"]
+        worker_run_id, output_digest = material["worker_run_id"], material["codex_output_sha256"]
+        ordered_paths, files = tuple(material["changed_paths"]), material["files"]
+        candidate_digest = material["candidate_digest"]
 
         if not _is_envelope(permit) or not _is_envelope(witness):
             raise PublisherGateHold("signed_permit_and_witness_required")

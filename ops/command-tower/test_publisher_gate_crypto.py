@@ -399,6 +399,62 @@ class PublisherGateCryptoTests(unittest.TestCase):
             issue_from_cli_request("permit_authority", request, context=context)
         self.assertEqual(journal.snapshot().sequence, 0)
 
+    def test_signing_cli_binds_trusted_signer_before_permit_journal_write(self) -> None:
+        journal = PermitCasJournal(MemoryCasBackend(), repository_id=REPOSITORY_ID)
+        request = {
+            "permit_id": "cli-signer-binding-permit",
+            "issuer_id": "permit_authority-key", "repository_id": REPOSITORY_ID,
+            "base_sha": BASE_SHA, "candidate_digest": self.manifest["candidate_digest"],
+            "changed_paths": [PATH], "worker_run_id": WORKER_RUN_ID,
+        }
+        wrong_permit_context = SigningContext(
+            role="permit_authority", signer=self.keys["witness"],
+            trusted_keys=self.trusted_keys, journal=journal,
+            verify_candidate_scope=lambda observed: observed == request,
+        )
+        with self.assertRaisesRegex(SigningCliHold, "role_signer_trust_binding_failed"):
+            issue_from_cli_request("permit_authority", request, context=wrong_permit_context)
+        self.assertEqual(journal.snapshot().sequence, 0)
+
+        permit = issue_from_cli_request("permit_authority", request, context=SigningContext(
+            role="permit_authority", signer=self.keys["permit_authority"],
+            trusted_keys=self.trusted_keys, journal=journal,
+            verify_candidate_scope=lambda observed: observed == request,
+        ))
+        self.assertEqual(journal.snapshot().sequence, 1)
+        wrong_witness_context = SigningContext(
+            role="witness", signer=self.keys["permit_authority"],
+            trusted_keys=self.trusted_keys, journal=journal,
+            verify_candidate_scope=lambda _observed: True,
+        )
+        with self.assertRaisesRegex(SigningCliHold, "role_signer_trust_binding_failed"):
+            issue_from_cli_request(
+                "witness", {"witness_id": "witness-key", "permit": permit},
+                context=wrong_witness_context,
+            )
+        self.assertEqual(journal.snapshot().sequence, 1)
+
+    def test_signing_cli_rejects_shared_permit_and_witness_trust_key(self) -> None:
+        journal = PermitCasJournal(MemoryCasBackend(), repository_id=REPOSITORY_ID)
+        shared = dict(self.trusted_keys)
+        shared["witness-key"] = TrustedVerificationKey(
+            "witness-key", "witness", public_bytes(self.keys["permit_authority"]),
+        )
+        request = {
+            "permit_id": "cli-shared-trust-key", "issuer_id": "permit_authority-key",
+            "repository_id": REPOSITORY_ID, "base_sha": BASE_SHA,
+            "candidate_digest": self.manifest["candidate_digest"],
+            "changed_paths": [PATH], "worker_run_id": WORKER_RUN_ID,
+        }
+        context = SigningContext(
+            role="permit_authority", signer=self.keys["permit_authority"],
+            trusted_keys=shared, journal=journal,
+            verify_candidate_scope=lambda observed: observed == request,
+        )
+        with self.assertRaisesRegex(SigningCliHold, "permit_witness_trust_keys_not_independent"):
+            issue_from_cli_request("permit_authority", request, context=context)
+        self.assertEqual(journal.snapshot().sequence, 0)
+
     def _delegation_case(self):
         """Build an ephemeral, real-Ed25519 test delegation and candidate."""
         verified_bundle = self.verify()

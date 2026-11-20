@@ -92,6 +92,8 @@ def _issue_permit(request: Mapping[str, object], context: SigningContext) -> dic
         raise SigningCliHold("permit_request_fields_invalid")
     _require_journal_and_scope(context)
     key = _trusted_role_key(context.trusted_keys, request.get("issuer_id"), "permit_authority")
+    _require_independent_permit_witness_keys(context.trusted_keys, key)
+    _verify_signer_binding(context.signer, key, "permit_authority")
     paths = _validate_permit_scope(request)
     _call_scope_verifier(context.verify_candidate_scope, request)
     try:
@@ -113,6 +115,8 @@ def _issue_witness(request: Mapping[str, object], context: SigningContext) -> di
         raise SigningCliHold("witness_request_fields_invalid")
     _require_journal_and_scope(context)
     key = _trusted_role_key(context.trusted_keys, request.get("witness_id"), "witness")
+    _require_independent_permit_witness_keys(context.trusted_keys, key)
+    _verify_signer_binding(context.signer, key, "witness")
     permit = request.get("permit")
     _validate_permit_envelope(permit, context.trusted_keys)
     payload = permit["payload"]
@@ -207,6 +211,41 @@ def _trusted_role_key(keys: Mapping[str, TrustedVerificationKey] | None,
     if key is None or key.key_id != key_id or key.role != expected_role:
         raise SigningCliHold("trusted_role_key_mismatch")
     return key
+
+
+def _require_independent_permit_witness_keys(
+        keys: Mapping[str, TrustedVerificationKey] | None,
+        active_key: TrustedVerificationKey) -> None:
+    """Require the two trust-side roles to resolve to distinct registered keys."""
+    if not isinstance(keys, Mapping):
+        raise SigningCliHold("trusted_role_key_missing")
+    permit_keys = [key for key in keys.values()
+                   if isinstance(key, TrustedVerificationKey)
+                   and key.role in {"permit_authority", "witness"}]
+    by_role = {key.role: key for key in permit_keys}
+    if (set(by_role) != _PERMIT_ROLES or len(permit_keys) != 2
+            or by_role["permit_authority"].public_key == by_role["witness"].public_key
+            or active_key.role not in _PERMIT_ROLES
+            or by_role.get(active_key.role) != active_key):
+        raise SigningCliHold("permit_witness_trust_keys_not_independent")
+
+
+def _verify_signer_binding(signer: Signer, key: TrustedVerificationKey,
+                           role: str) -> None:
+    """Prove the injected signer belongs to this role before any journal write."""
+    challenge = canonical_json({
+        "domain": "B09_F4_SIGNER_BINDING_V1",
+        "repository_id": REPOSITORY_ID,
+        "role": role,
+        "key_id": key.key_id,
+    })
+    try:
+        signature = signer.sign(challenge)
+        if not isinstance(signature, bytes) or len(signature) != 64:
+            raise ValueError("invalid signature size")
+        _verify_ed25519(key.public_key, signature, challenge)
+    except Exception:
+        raise SigningCliHold("role_signer_trust_binding_failed") from None
 
 
 def _verify_role_envelope(envelope: object, key: TrustedVerificationKey,

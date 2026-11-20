@@ -44,7 +44,8 @@ const canonical = (value) => value === null || typeof value !== "object"
   : `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
 const hash = async (value) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical(value)))), (b) => b.toString(16).padStart(2, "0")).join("");
 function request(method, name, key = F4_CONTROL_KEY, options = {}) {
-  return new Request(`https://fixture.invalid/functions/v1/sake-cas-v1/${key}`, { method, headers: { ...auth(name), ...(options.headers ?? {}) }, body: options.body });
+  const path = options.path ?? `/functions/v1/sake-cas-v1/${key}`;
+  return new Request(`https://fixture.invalid${path}`, { method, headers: { ...auth(name), ...(options.headers ?? {}) }, body: options.body });
 }
 async function initialDocument() {
   const statusPayload = { schema: 1, kind: "F4_REVOCATION_STATUS", repository_id: 1458303357, approval_id: "f4-fixture", go_sha256: "a".repeat(64), sequence: 1, status: "ACTIVE", valid_from: new Date(Date.now() - 60_000).toISOString(), valid_until: new Date(Date.now() + 60 * 60_000).toISOString() };
@@ -113,6 +114,50 @@ test("fixed control keys, independent credentials, and role transitions fail clo
   assert.equal((await handleF4ControlRequest(request("PUT", "B09_F4_CONTROL_V2_WORKER_BEARER", F4_CONTROL_KEY, { headers: { "content-type": "application/json", "if-match": '"3"' }, body: JSON.stringify(cycle2AfterAudit) }), deps)).status, 204);
   const wrongMode = await handleF4ControlRequest(request("GET", "B09_F4_CONTROL_V2_TEST_READ_BEARER", F4_CONTROL_KEY), deps);
   assert.equal(wrongMode.status, 403);
+});
+
+test("F4 handler accepts all fixed path aliases and rejects cross-mode or altered paths", async () => {
+  const isolatedStore = new Store();
+  const isolatedDeps = { env: { get: (name) => envValues[name] }, store: isolatedStore };
+  const prefixes = [
+    "/functions/v1/sake-cas-v1/",
+    "/sake-cas-v1/",
+    "/",
+  ];
+
+  for (const prefix of prefixes) {
+    const aliasIndex = prefixes.indexOf(prefix);
+    const formal = await handleF4ControlRequest(request(
+      "GET", "B09_F4_CONTROL_V2_READ_BEARER", F4_CONTROL_KEY,
+      { path: prefix + F4_CONTROL_KEY },
+    ), isolatedDeps);
+    assert.equal(formal.status, 404);
+    assert.equal(isolatedStore.reads, aliasIndex * 2 + 1);
+
+    const test = await handleF4ControlRequest(request(
+      "GET", "B09_F4_CONTROL_V2_TEST_READ_BEARER", F4_CONTROL_TEST_KEY,
+      { path: prefix + F4_CONTROL_TEST_KEY },
+    ), isolatedDeps);
+    assert.equal(test.status, 404);
+    assert.equal(isolatedStore.reads, aliasIndex * 2 + 2);
+  }
+
+  const readsBeforeCrossMode = isolatedStore.reads;
+  assert.equal((await handleF4ControlRequest(request(
+    "GET", "B09_F4_CONTROL_V2_TEST_READ_BEARER", F4_CONTROL_KEY,
+  ), isolatedDeps)).status, 403);
+  assert.equal(isolatedStore.reads, readsBeforeCrossMode);
+
+  for (const path of [
+    "/extra/functions/v1/sake-cas-v1/" + F4_CONTROL_KEY,
+    "/functions/v1/sake-cas-v1/" + F4_CONTROL_KEY + "/suffix",
+    "/functions/v1/sake-cas-v1-extra/" + F4_CONTROL_KEY,
+  ]) {
+    assert.equal((await handleF4ControlRequest(request(
+      "GET", "B09_F4_CONTROL_V2_READ_BEARER", F4_CONTROL_KEY, { path },
+    ), isolatedDeps)).status, 404, path);
+  }
+  assert.equal(isolatedStore.reads, readsBeforeCrossMode);
 });
 
 test("duplicate credentials and corrupted journal read fail closed", async () => {

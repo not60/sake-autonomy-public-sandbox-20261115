@@ -1,6 +1,8 @@
 /** Pure request and journal boundary; no Supabase or network side effects. */
 export const CAS_KEY = "repositories/1458303357/b09-permit-journal-v1.json";
 export const RETIRED_CAS_TEST_KEY = "repositories/1458303357/b09-permit-journal-test-v1.json";
+export const F4_CONTROL_KEY = "repositories/1458303357/b09-f4-cycle-control-v1.json";
+export const F4_CONTROL_TEST_KEY = "repositories/1458303357/b09-f4-cycle-control-test-v1.json";
 export const REPOSITORY_ID = 1458303357;
 export const MAX_DOCUMENT_BYTES = 1024 * 1024;
 export const CAS_AUTH_GENERATION = "v2";
@@ -72,23 +74,50 @@ type Journal = {
   events: JournalEvent[];
 };
 
+export type FixedCasRoute = {
+  key: string;
+  handler: "permit" | "f4-control";
+};
+
+const fixedPathPrefixes = [
+  "/functions/v1/sake-cas-v1/",
+  "/sake-cas-v1/",
+  "/",
+] as const;
+const fixedPathRoutes = new Map<string, FixedCasRoute>();
+for (const [key, handler] of [
+  [CAS_KEY, "permit"],
+  [RETIRED_CAS_TEST_KEY, "permit"],
+  [F4_CONTROL_KEY, "f4-control"],
+  [F4_CONTROL_TEST_KEY, "f4-control"],
+] as const) {
+  const route = Object.freeze({ key, handler });
+  for (const prefix of fixedPathPrefixes) fixedPathRoutes.set(prefix + key, route);
+}
+
+export function resolveFixedCasRoute(pathname: string): FixedCasRoute | null {
+  return fixedPathRoutes.get(pathname) ?? null;
+}
+
+export function dispatchFixedCasRequest<T>(
+  pathname: string,
+  handlers: { permit: () => T; f4Control: () => T },
+): T {
+  return resolveFixedCasRoute(pathname)?.handler === "f4-control"
+    ? handlers.f4Control()
+    : handlers.permit();
+}
+
 const encoder = new TextEncoder();
 const shaPattern = /^[0-9a-f]{64}$/;
-const formalPaths = new Set([
-  "/functions/v1/sake-cas-v1/" + CAS_KEY,
-  "/" + CAS_KEY,
-]);
-const retiredTestPaths = new Set([
-  "/functions/v1/sake-cas-v1/" + RETIRED_CAS_TEST_KEY,
-  "/" + RETIRED_CAS_TEST_KEY,
-]);
 
 export async function handleCasRequest(
   request: Request,
   dependencies: CasDependencies,
 ): Promise<Response> {
   const pathname = new URL(request.url).pathname;
-  if (retiredTestPaths.has(pathname)) return response(410);
+  const route = resolveFixedCasRoute(pathname);
+  if (route?.key === RETIRED_CAS_TEST_KEY) return response(410);
   const authGenerationFailure = casAuthGenerationFailure(request, dependencies.env);
   if (authGenerationFailure !== null) return response(authGenerationFailure);
   const tokens = readRoleTokens(dependencies.env);
@@ -98,8 +127,8 @@ export async function handleCasRequest(
   if (!principal) return response(401);
   if (!dependencies.store) return response(503);
 
-  if (!formalPaths.has(pathname)) return response(404);
-  const key = CAS_KEY;
+  if (!route || route.handler !== "permit" || route.key !== CAS_KEY) return response(404);
+  const key = route.key;
 
   if (request.method === "GET") {
     try {

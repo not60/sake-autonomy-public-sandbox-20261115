@@ -3,9 +3,13 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   CAS_KEY,
+  F4_CONTROL_KEY,
+  F4_CONTROL_TEST_KEY,
   MAX_DOCUMENT_BYTES,
   RETIRED_CAS_TEST_KEY,
+  dispatchFixedCasRequest,
   handleCasRequest,
+  resolveFixedCasRoute,
 } from "../supabase/functions/sake-cas-v1/core.ts";
 
 const tokens = {
@@ -343,7 +347,8 @@ test("Edge candidate matches existing CAS caller secret names and does not use s
   assert.doesNotMatch(permitRegistry, /B09_CAS_V2_TEST_(?:ISSUER|WITNESS|PUBLISHER|AUDITOR)_BEARER/);
   assert.match(core, /B09_CAS_V2_TEST_(?:ISSUER|WITNESS|PUBLISHER|AUDITOR)_BEARER/);
   assert.match(core, /B09_CAS_AUTH_GENERATION/);
-  assert.match(core, /retiredTestPaths\.has\(pathname\).*response\(410\)/s);
+  assert.match(core, /route\?\.key === RETIRED_CAS_TEST_KEY\) return response\(410\)/);
+  assert.match(core, /resolveFixedCasRoute\(pathname\)/);
   assert.match(core, /RETIRED_TOKEN_ENV_NAMES\.some\(\(name\) => env\.get\(name\) !== undefined\)/);
   assert.match(index, /B09_CAS_DB_URL/);
   assert.doesNotMatch(index, /CAS_TEST_KEY/);
@@ -354,10 +359,56 @@ test("Edge candidate matches existing CAS caller secret names and does not use s
   assert.ok(root.pathname.endsWith("/supabase-cas-draft/"));
 });
 
+test("fixed route registry and entrypoint dispatch accept only the four exact keys and three prefixes", async () => {
+  const prefixes = [
+    "/functions/v1/sake-cas-v1/",
+    "/sake-cas-v1/",
+    "/",
+  ];
+  const routes = [
+    [CAS_KEY, "permit"],
+    [RETIRED_CAS_TEST_KEY, "permit"],
+    [F4_CONTROL_KEY, "f4-control"],
+    [F4_CONTROL_TEST_KEY, "f4-control"],
+  ];
+  for (const [key, handler] of routes) {
+    for (const prefix of prefixes) {
+      const path = prefix + key;
+      assert.deepEqual(resolveFixedCasRoute(path), { key, handler });
+      assert.equal(dispatchFixedCasRequest(path, {
+        permit: () => "permit",
+        f4Control: () => "f4-control",
+      }), handler);
+    }
+  }
+
+  const rejected = [
+    "/extra/functions/v1/sake-cas-v1/" + CAS_KEY,
+    "/functions/v1/sake-cas-v1-extra/" + CAS_KEY,
+    "/functions/v1/sake-cas-v1/" + CAS_KEY + "/suffix",
+    "/sake-cas-v1/" + F4_CONTROL_TEST_KEY + "extra",
+    "/repositories/1458303357/b09-f4-cycle-control-v1.json/extra",
+    "/repositories/1458303357/not-a-fixed-key.json",
+  ];
+  for (const path of rejected) {
+    assert.equal(resolveFixedCasRoute(path), null, path);
+    assert.equal(dispatchFixedCasRequest(path, {
+      permit: () => "permit",
+      f4Control: () => "f4-control",
+    }), "permit", path);
+  }
+
+  const index = await readFile(new URL("../supabase/functions/sake-cas-v1/index.ts", import.meta.url), "utf8");
+  assert.match(index, /dispatchFixedCasRequest\(new URL\(request\.url\)\.pathname/);
+  assert.match(index, /f4Control: \(\) => handleF4ControlRequest/);
+  assert.match(index, /permit: \(\) => handleCasRequest/);
+});
+
 test("retired Permit TEST paths reject every method, credential, and generation before DB access", async () => {
   const store = new FixtureStore();
   const paths = [
     "/functions/v1/sake-cas-v1/" + RETIRED_CAS_TEST_KEY,
+    "/sake-cas-v1/" + RETIRED_CAS_TEST_KEY,
     "/" + RETIRED_CAS_TEST_KEY,
   ];
   const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -378,17 +429,37 @@ test("retired Permit TEST paths reject every method, credential, and generation 
           if (method === "PUT" || method === "POST" || method === "PATCH") {
             headers.set("content-type", "application/json");
           }
-          const response = await handleCasRequest(new Request("https://fixture.invalid" + path, {
+          const incoming = new Request("https://fixture.invalid" + path, {
             method,
             headers,
             body: method === "PUT" || method === "POST" || method === "PATCH" ? "{}" : undefined,
-          }), deps(store));
+          });
+          const response = await dispatchFixedCasRequest(new URL(incoming.url).pathname, {
+            permit: () => handleCasRequest(incoming, deps(store)),
+            f4Control: () => new Response(null, { status: 418 }),
+          });
           assert.equal(response.status, 410, `${method} ${path} generation=${generation}`);
         }
       }
     }
   }
   assert.equal(store.reads, 0);
+  assert.equal(store.inserts, 0);
+  assert.equal(store.updates, 0);
+});
+
+test("formal Permit path aliases retain authenticated handler behavior", async () => {
+  const store = new FixtureStore();
+  const paths = [
+    "/functions/v1/sake-cas-v1/" + CAS_KEY,
+    "/sake-cas-v1/" + CAS_KEY,
+    "/" + CAS_KEY,
+  ];
+  for (const [index, path] of paths.entries()) {
+    const response = await handleCasRequest(request("GET", "issuer", { path }), deps(store));
+    assert.equal(response.status, 404);
+    assert.equal(store.reads, index + 1);
+  }
   assert.equal(store.inserts, 0);
   assert.equal(store.updates, 0);
 });

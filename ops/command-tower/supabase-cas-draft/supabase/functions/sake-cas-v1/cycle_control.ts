@@ -1,14 +1,16 @@
 /** DRAFT_HOLD F4 cycle-control CAS route, isolated from Permit journal events. */
 import {
   F4_TOKEN_ENV,
+  F4_CONTROL_KEY,
+  F4_CONTROL_TEST_KEY,
   casAuthGenerationFailure,
+  resolveFixedCasRoute,
   readV2RoleTokens,
   type CasDependencies,
   type CasStoredDocument,
 } from "./core.ts";
 
-export const F4_CONTROL_KEY = "repositories/1458303357/b09-f4-cycle-control-v1.json";
-export const F4_CONTROL_TEST_KEY = "repositories/1458303357/b09-f4-cycle-control-test-v1.json";
+export { F4_CONTROL_KEY, F4_CONTROL_TEST_KEY } from "./core.ts";
 const REPOSITORY_ID = 1458303357;
 const encoder = new TextEncoder();
 const shaPattern = /^[0-9a-f]{64}$/;
@@ -52,13 +54,11 @@ export async function handleF4ControlRequest(
   if (authGenerationFailure !== null) return response(authGenerationFailure);
   const principal = identify(request.headers.get("authorization"), dependencies.env);
   if (!principal || !dependencies.store) return response(principal ? 503 : 401);
-  const path = new URL(request.url).pathname;
-  const formalPath = path === "/functions/v1/sake-cas-v1/" + F4_CONTROL_KEY || path === "/" + F4_CONTROL_KEY;
-  const testPath = path === "/functions/v1/sake-cas-v1/" + F4_CONTROL_TEST_KEY || path === "/" + F4_CONTROL_TEST_KEY;
-  if (!formalPath && !testPath) return response(404);
-  const mode: ControlMode = formalPath ? "formal" : "test";
+  const route = resolveFixedCasRoute(new URL(request.url).pathname);
+  if (!route || route.handler !== "f4-control") return response(404);
+  const mode: ControlMode = route.key === F4_CONTROL_KEY ? "formal" : "test";
   if (principal.mode !== mode) return response(403);
-  const key = formalPath ? F4_CONTROL_KEY : F4_CONTROL_TEST_KEY;
+  const key = route.key;
   if (request.method === "GET") {
     try {
       const stored = await dependencies.store.read(key);

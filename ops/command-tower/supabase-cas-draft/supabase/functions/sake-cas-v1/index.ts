@@ -2,10 +2,13 @@ import { Client } from "jsr:@db/postgres@0.19.5";
 import {
   handleCasRequest,
   CAS_KEY,
+  F4_CONTROL_KEY,
+  F4_CONTROL_TEST_KEY,
+  dispatchFixedCasRequest,
   type CasStore,
   type CasStoredDocument,
 } from "./core.ts";
-import { F4_CONTROL_KEY, F4_CONTROL_TEST_KEY, handleF4ControlRequest } from "./cycle_control.ts";
+import { handleF4ControlRequest } from "./cycle_control.ts";
 
 const F4_CONTROL_KEYS = new Set([F4_CONTROL_KEY, F4_CONTROL_TEST_KEY]);
 // Keep the historical Permit TEST row under the table CHECK only. The Edge role
@@ -76,11 +79,8 @@ const databaseUrl = Deno.env.get("B09_CAS_DB_URL") ?? "";
 const store = databaseUrl ? new PostgresCasStore(databaseUrl) : null;
 
 Deno.serve((request) => {
-  const path = new URL(request.url).pathname;
-  const isF4ControlPath = [...F4_CONTROL_KEYS].some((key) =>
-    path === "/functions/v1/sake-cas-v1/" + key || path === "/" + key
-  );
-  return isF4ControlPath
-    ? handleF4ControlRequest(request, { env, store })
-    : handleCasRequest(request, { env, store });
+  return dispatchFixedCasRequest(new URL(request.url).pathname, {
+    permit: () => handleCasRequest(request, { env, store }),
+    f4Control: () => handleF4ControlRequest(request, { env, store }),
+  });
 });

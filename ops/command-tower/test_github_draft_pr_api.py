@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
+import os
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from draft_pr_writer import (
     GitHubApiHold,
+    GitHubAppInstallationCredentialIssuer,
     GitHubDraftPrApi,
     GitHubPermissionScopeUnverifiable,
     DraftPrWriter,
@@ -67,10 +71,150 @@ class GitHubDraftPrApiTests(unittest.TestCase):
             "id": PUBLIC_REPOSITORY_ID, "full_name": PUBLIC_REPOSITORY,
             "permissions": {"admin": True, "push": True, "pull": True},
         })])
-        with self.assertRaisesRegex(GitHubPermissionScopeUnverifiable, "not_exposed"):
+        with self.assertRaisesRegex(GitHubPermissionScopeUnverifiable, "evidence"):
             self.api(transport).get_permissions(PUBLIC_REPOSITORY_ID)
         self.assertEqual(len(transport.calls), 1)
         self.assertEqual(transport.calls[0][0], "GET")
+
+    def _app_issuer_responses(self, *, permissions=None, repositories=None,
+                              expiry="2027-01-15T08:30:00Z"):
+        now = 1_800_000_000
+        return now, [
+            reply({"id": 184026537, "app_id": 5848436,
+                   "permissions": {"contents": "write", "pull_requests": "write",
+                                   "metadata": "read"}}),
+            reply({"token": "ghs-test-issued-token", "expires_at": expiry,
+                   "repository_selection": "selected",
+                   "permissions": permissions or {
+                       "contents": "write", "pull_requests": "write", "metadata": "read",
+                   }} , status=201),
+            reply({"total_count": 1 if repositories is None else len(repositories),
+                   "repositories": repositories or [{
+                       "id": PUBLIC_REPOSITORY_ID, "full_name": PUBLIC_REPOSITORY,
+                   }]}),
+        ]
+
+    def test_app_issuance_binds_exact_repo_permissions_expiry_and_same_token(self):
+        now, responses = self._app_issuer_responses()
+        transport = FakeTransport(responses)
+        with patch("draft_pr_writer._github_app_jwt", return_value="dummy-app-jwt"):
+            token, evidence = GitHubAppInstallationCredentialIssuer(
+                app_id=5848436, installation_id=184026537,
+                private_key_pem="test-only-private-key-fixture",
+                transport=transport, wall_time_fn=lambda: now,
+            ).issue()
+        self.assertEqual(token, "ghs-test-issued-token")
+        self.assertEqual(evidence.repository_ids, (PUBLIC_REPOSITORY_ID,))
+        self.assertEqual(evidence.token_sha256, hashlib.sha256(token.encode()).hexdigest())
+        self.assertEqual(evidence.permissions, tuple(sorted({
+            "contents": "write", "pull_requests": "write", "metadata": "read",
+        }.items())))
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "POST", "GET"])
+        self.assertEqual(json.loads(transport.calls[1][3]), {
+            "repository_ids": [PUBLIC_REPOSITORY_ID],
+            "permissions": {"contents": "write", "pull_requests": "write"},
+        })
+        self.assertEqual(transport.calls[0][2]["Authorization"], "Bearer dummy-app-jwt")
+        self.assertEqual(transport.calls[1][2]["Authorization"], "Bearer dummy-app-jwt")
+        self.assertEqual(transport.calls[2][2]["Authorization"], f"Bearer {token}")
+        self.assertNotIn("dummy-app-jwt", repr(evidence))
+
+        api = GitHubDraftPrApi(
+            token, transport=FakeTransport([reply({
+                "id": PUBLIC_REPOSITORY_ID, "full_name": PUBLIC_REPOSITORY,
+            })]), permission_evidence=evidence, wall_time_fn=lambda: now,
+        )
+        snapshot = api.get_permissions(PUBLIC_REPOSITORY_ID)
+        self.assertEqual(snapshot.permissions, {
+            "contents": "write", "pull_requests": "write", "metadata": "read",
+            "actions": "none",
+        })
+        self.assertEqual(snapshot.evidence, evidence)
+
+    def test_app_issuance_rejects_extra_action_permission_and_wrong_repo_scope(self):
+        cases = (
+            {"permissions": {"contents": "write", "pull_requests": "write",
+                             "metadata": "read", "actions": "read"}},
+            {"permissions": {"contents": "read", "pull_requests": "write",
+                             "metadata": "read"}},
+            {"repositories": [{"id": 12, "full_name": "other/repo"}]},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                now, responses = self._app_issuer_responses(**kwargs)
+                transport = FakeTransport(responses)
+                with patch("draft_pr_writer._github_app_jwt", return_value="dummy-app-jwt"):
+                    with self.assertRaises(GitHubApiHold):
+                        GitHubAppInstallationCredentialIssuer(
+                            app_id=5848436, installation_id=184026537,
+                            private_key_pem="test-only-private-key-fixture",
+                            transport=transport, wall_time_fn=lambda: now,
+                        ).issue()
+
+    def test_raw_token_or_changed_token_cannot_claim_permission_proof(self):
+        transport = FakeTransport([reply({
+            "id": PUBLIC_REPOSITORY_ID, "full_name": PUBLIC_REPOSITORY,
+        })])
+        with self.assertRaisesRegex(GitHubPermissionScopeUnverifiable, "evidence"):
+            self.api(transport).get_permissions(PUBLIC_REPOSITORY_ID)
+        now, responses = self._app_issuer_responses()
+        with patch("draft_pr_writer._github_app_jwt", return_value="dummy-app-jwt"):
+            token, evidence = GitHubAppInstallationCredentialIssuer(
+                app_id=5848436, installation_id=184026537,
+                private_key_pem="test-only-private-key-fixture",
+                transport=FakeTransport(responses), wall_time_fn=lambda: now,
+            ).issue()
+        changed = GitHubDraftPrApi(
+            token + "-changed", transport=FakeTransport([reply({
+                "id": PUBLIC_REPOSITORY_ID, "full_name": PUBLIC_REPOSITORY,
+            })]), permission_evidence=evidence, wall_time_fn=lambda: now,
+        )
+        with self.assertRaisesRegex(GitHubPermissionScopeUnverifiable, "evidence"):
+            changed.get_permissions(PUBLIC_REPOSITORY_ID)
+
+    def test_app_environment_requires_private_key_and_has_no_legacy_token_fallback(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(GitHubApiHold, "private_key_missing"):
+                GitHubDraftPrApi.from_publisher_app_environment()
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"),
+                         "cryptography is pinned for CI but unavailable in this local Python")
+    def test_app_jwt_uses_rsa_signature_and_short_fixed_claims(self):
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+        from draft_pr_writer import _github_app_jwt
+
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        private_pem = private_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode("ascii")
+        now = 1_800_000_000
+        encoded = _github_app_jwt(5848436, private_pem, now)
+        header_part, payload_part, signature_part = encoded.split(".")
+        unpad = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        header = json.loads(unpad(header_part))
+        payload = json.loads(unpad(payload_part))
+        self.assertEqual(header, {"alg": "RS256", "typ": "JWT"})
+        self.assertEqual(payload, {"iss": "5848436", "iat": now - 60, "exp": now + 540})
+        private_key.public_key().verify(
+            unpad(signature_part), f"{header_part}.{payload_part}".encode("ascii"),
+            padding.PKCS1v15(), hashes.SHA256(),
+        )
+
+    def test_app_issuance_rejects_expired_token_without_retry(self):
+        now, responses = self._app_issuer_responses(expiry="2027-01-15T08:00:00Z")
+        transport = FakeTransport(responses)
+        with patch("draft_pr_writer._github_app_jwt", return_value="dummy-app-jwt"):
+            issuer = GitHubAppInstallationCredentialIssuer(
+                app_id=5848436, installation_id=184026537,
+                private_key_pem="test-only-private-key-fixture",
+                transport=transport, wall_time_fn=lambda: now,
+            )
+            with self.assertRaisesRegex(GitHubApiHold, "expiry_out_of_bounds"):
+                issuer.issue()
+            with self.assertRaisesRegex(GitHubApiHold, "already_attempted"):
+                issuer.issue()
 
     def test_missing_github_credential_is_rejected_without_io(self):
         transport = FakeTransport()
@@ -266,7 +410,8 @@ class GitHubDraftPrApiTests(unittest.TestCase):
     def test_publisher_cli_connects_gate_plan_to_writer_without_default_write(self):
         source = Path(__file__).with_name("publisher_gate.py").read_text(encoding="utf-8")
         self.assertIn('parser.add_argument("--draft-pr-write", action="store_true"', source)
-        self.assertIn('os.environ.get("B09_PUBLISHER_GITHUB_TOKEN", "")', source)
+        self.assertIn("GitHubDraftPrApi.from_publisher_app_environment()", source)
+        self.assertNotIn('os.environ.get("B09_PUBLISHER_GITHUB_TOKEN", "")', source)
         self.assertIn("DraftPrWriter(api).commit_verified_artifact_and_create_draft(", source)
         self.assertIn('sys.modules.setdefault("publisher_gate", sys.modules[__name__])', source)
         self.assertIn("DRAFT_PR_PLAN_READY_NO_GITHUB_WRITE", source)

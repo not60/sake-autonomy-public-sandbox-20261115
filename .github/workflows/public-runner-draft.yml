@@ -242,12 +242,42 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Verify the protected Publisher source revision
+        env:
+          EXPECTED_TRUSTED_REF: refs/heads/trusted/f4-nonprod-20261119
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "$EXPECTED_TRUSTED_REF" || { echo 'HOLD: Publisher must run from the protected trusted ref.' >&2; exit 78; }
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'HOLD: trusted source revision is invalid.' >&2; exit 78; }
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA" || { echo 'HOLD: checkout differs from dispatch revision.' >&2; exit 78; }
+          test -z "$(git status --porcelain --untracked-files=no)" || { echo 'HOLD: trusted source checkout is modified.' >&2; exit 78; }
+          for path in .github/workflows/public-runner-draft.yml ops/command-tower/publisher_gate.py ops/command-tower/draft_pr_writer.py ops/command-tower/requirements-publisher.txt; do
+            git cat-file -e "$GITHUB_SHA:$path" || { echo 'HOLD: trusted source closure is incomplete.' >&2; exit 78; }
+          done
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
       - name: Install the pinned verification dependency
         run: python -m pip install --disable-pip-version-check -r ops/command-tower/requirements-publisher.txt
+      - name: Verify Publisher imports resolve only from the trusted revision
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib, pathlib, sys
+          root = (pathlib.Path.cwd() / 'ops/command-tower').resolve(strict=True)
+          sys.path.insert(0, str(root))
+          modules = ('publisher_gate', 'draft_pr_writer', 'f4_cycle_runtime',
+                     'f4_limited_delegation', 'cas_journal', 'durable_store',
+                     'trusted_key_registry', 'attestations')
+          for name in modules:
+              module = importlib.import_module(name)
+              path = pathlib.Path(module.__file__).resolve(strict=True)
+              try:
+                  path.relative_to(root)
+              except ValueError:
+                  raise SystemExit('HOLD: Publisher import escaped trusted source.') from None
+          PY
       - name: Require completed Worker and signed-attestation source run IDs
         env:
           WORKER_RUN_ID: ${{ inputs.worker_run_id }}
@@ -331,7 +361,7 @@ jobs:
           B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
           B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
           B09_CAS_V2_PUBLISHER_BEARER: ${{ secrets.B09_CAS_V2_PUBLISHER_BEARER }}
-          B09_PUBLISHER_GITHUB_TOKEN: ${{ secrets.B09_PUBLISHER_GITHUB_TOKEN }}
+          B09_PUBLISHER_GITHUB_APP_PRIVATE_KEY_PEM: ${{ secrets.B09_PUBLISHER_GITHUB_APP_PRIVATE_KEY_PEM }}
         run: |
           set -euo pipefail
           [[ "${PUBLISHER_ATTESTATION_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: independent signed Publisher bundle run ID missing.' >&2; exit 78; }

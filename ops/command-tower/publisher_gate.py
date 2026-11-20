@@ -602,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--f4-cycle", type=int, choices=(1, 2))
     parser.add_argument("--f4-claim-receipt")
     args = parser.parse_args(argv)
-    from draft_pr_writer import DraftPrWriter, GitHubDraftPrApi, WriterHold
+    from draft_pr_writer import DraftPrWriter, GitHubApiHold, GitHubDraftPrApi, WriterHold
 
     store: DurableStore | None = None
     try:
@@ -682,10 +682,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.role == "publisher":
             plan = prepare_draft_pr_plan(result)
             if args.draft_pr_write:
-                github_token = os.environ.get("B09_PUBLISHER_GITHUB_TOKEN", "")
-                if not github_token:
-                    raise WriterHold("publisher_github_credential_missing")
-                api = GitHubDraftPrApi(github_token)
+                api = GitHubDraftPrApi.from_publisher_app_environment()
                 expected_head = args.expected_head_sha or api.get_branch(
                     PUBLIC_REPOSITORY_ID, PUBLIC_HEAD_BRANCH,
                 ).sha
@@ -716,6 +713,9 @@ def main(argv: list[str] | None = None) -> int:
                 })
     except WriterHold as exc:
         print(f"HOLD:{exc.reason}", file=sys.stderr)
+        return 2
+    except GitHubApiHold as exc:
+        print(f"HOLD:{exc}", file=sys.stderr)
         return 2
     except PublisherGateHold as exc:
         print(f"HOLD:{exc.reason}", file=sys.stderr)

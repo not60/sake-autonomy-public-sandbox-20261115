@@ -67,6 +67,7 @@ class FakeApi:
         return PermissionSnapshot(repository_id, "publisher", {
             "contents": self.contents_permission,
             "pull_requests": "write",
+            "metadata": "read",
             "actions": "none",
         })
 

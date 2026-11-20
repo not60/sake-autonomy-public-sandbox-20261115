@@ -47,7 +47,8 @@ def plan() -> DraftPrPlan:
 class FakeApi:
     def __init__(self) -> None:
         self.permission_values = {
-            "contents": "write", "pull_requests": "write", "actions": "none",
+            "contents": "write", "pull_requests": "write", "metadata": "read",
+            "actions": "none",
         }
         self.request: DraftPrRequest | None = None
         self.write_calls = 0

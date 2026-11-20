@@ -482,6 +482,139 @@ class PublisherGateCryptoTests(unittest.TestCase):
                 self.assertIs(context.verify_revocation_status, template.verify_revocation_status)
                 self.assertIs(context.journal, template.journal)
 
+    def _trusted_connection_case(self):
+        """Reuse role keys, signed delegation and the existing Actions metadata fixture."""
+        import zipfile
+        from test_github_worker_provenance import WorkerArtifactProvenanceTests
+        fixture = WorkerArtifactProvenanceTests()
+        fixture.setUp()
+        contract, status, evidence, _authorization, _verifier = self._delegation_case()
+        material = {k: v for k, v in self.manifest.items() if k != "candidate_digest"}
+        material["worker_run_id"] = fixture.manifest["worker_run_id"]
+        manifest = {**material, "candidate_digest": hashlib.sha256(canonical_json(material)).hexdigest()}
+        archive = Path(self.temporary.name) / "worker.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("manifest.json", canonical_json(manifest))
+            bundle.writestr("files/" + PATH, CONTENT)
+            bundle.writestr("evidence/codex-output.bin", CODEX_OUTPUT)
+        fixture.artifacts["artifacts"][0]["digest"] = "sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest()
+        journal = PermitCasJournal(MemoryCasBackend(), repository_id=REPOSITORY_ID)
+        request = {"permit_id": "connection-permit", "issuer_id": "permit_authority-key",
+                   **{k: manifest[k] for k in ("repository_id", "base_sha", "candidate_digest", "changed_paths", "worker_run_id")}}
+        params = dict(gate=self._gate(self.store, journal=journal), journal=journal,
+                      artifact_root=self.root, manifest=manifest, codex_output_file=self.output,
+                      expected_run_id="12345", expected_execution_sha=BASE_SHA,
+                      cycle=1, cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
+                      github_read_token="test-only-not-a-real-token", worker_archive_path=archive,
+                      authenticated_execution_check=lambda: True,
+                      read_authenticated_delegation_status=lambda _scope: dict(status))
+        def github_read(path, **_kwargs):
+            return fixture.artifacts if path.endswith("/artifacts") else fixture.run
+        return params, request, contract, status, evidence, github_read
+
+    def test_new_context_joins_provenance_scope_cas_and_signature_artifact(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        from f4_signing_provider import build_verification_context, write_signature_artifact
+        params, request, contract, status, evidence, github_read = self._trusted_connection_case()
+        with patch("github_worker_provenance._get_json", side_effect=github_read):
+            context = replace(build_verification_context(role="permit_authority", **params), signer=self.keys["permit_authority"])
+            permit = issue_from_cli_request("permit_authority", request, context=context)
+            witness_context = replace(build_verification_context(role="witness", **params), signer=self.keys["witness"])
+            witness = issue_from_cli_request("witness", {"witness_id": "witness-key", "permit": permit}, context=witness_context)
+            context = build_verification_context(role="owner_a_delegate", permit=permit, witness=witness, **params)
+            context = replace(context, now=F4_NOW)
+            self.assertTrue(context.verify_revocation_status(status, contract["payload"]))
+            delegation = verify_delegation_contract(
+                envelope=contract, trusted_owner_keys=self.trusted_keys,
+                expected_execution_revision=BASE_SHA, expected_cycle_tasks=params["cycle_tasks"],
+                revocation_status=status, verify_revocation_status=context.verify_revocation_status, now=F4_NOW)
+            from github_worker_provenance import verify_worker_artifact_provenance
+            proof = verify_worker_artifact_provenance(params["manifest"], expected_run_id="12345",
+                expected_base_sha=BASE_SHA, expected_execution_sha=BASE_SHA, expected_cycle=1, bearer_token="test-only")
+            snapshot = params["journal"].snapshot()
+            evidence = {**evidence, "candidate_digest": params["manifest"]["candidate_digest"],
+                        "run_id": params["manifest"]["worker_run_id"],
+                        "permit_digest": hashlib.sha256(canonical_json(permit["payload"])).hexdigest(),
+                        "witness_digest": hashlib.sha256(canonical_json(witness)).hexdigest(),
+                        "cas_revision": snapshot.sequence, "cas_head_sha256": snapshot.head_sha256,
+                        "worker_provenance_digest": hashlib.sha256(canonical_json(proof)).hexdigest()}
+            self.assertTrue(context.verify_candidate_evidence(evidence, delegation))
+            self.assertFalse(context.verify_candidate_evidence({**evidence, "witness_digest": "0" * 64}, delegation))
+            target = Path(self.temporary.name) / "witness-envelope.json"
+            digest = write_signature_artifact(output=target, role="witness", envelope=witness, trusted_key=self.trusted_keys["witness-key"])
+            self.assertEqual(digest, hashlib.sha256(target.read_bytes()).hexdigest())
+            self.assertEqual(json.loads(target.read_text()), witness)
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                write_signature_artifact(output=target, role="witness", envelope=witness, trusted_key=self.trusted_keys["witness-key"])
+            bad_target = target.with_name("tampered.json")
+            with self.assertRaises(Exception):
+                write_signature_artifact(output=bad_target, role="witness",
+                    envelope={**witness, "payload": {**witness["payload"], "candidate_digest": "0" * 64}},
+                    trusted_key=self.trusted_keys["witness-key"])
+            self.assertFalse(bad_target.exists())
+            self.assertEqual(params["journal"].snapshot().sequence, 1)
+
+    def test_new_context_stops_for_archive_tamper_or_missing_trusted_inputs(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        from f4_signing_provider import build_verification_context
+        params, request, _contract, _status, _evidence, github_read = self._trusted_connection_case()
+        with self.assertRaises(SigningCliHold):
+            build_verification_context(role="permit_authority", **{**params, "authenticated_execution_check": None})
+        with patch("github_worker_provenance._get_json", side_effect=github_read):
+            context = replace(build_verification_context(role="permit_authority", **params), signer=self.keys["permit_authority"])
+            params["worker_archive_path"].write_bytes(b"tampered archive")
+            with self.assertRaises(SigningCliHold):
+                issue_from_cli_request("permit_authority", request, context=context)
+            self.assertEqual(params["journal"].snapshot().sequence, 0)
+            context = replace(build_verification_context(role="permit_authority", **{**params, "authenticated_execution_check": lambda: False}), signer=self.keys["permit_authority"])
+            with self.assertRaises(SigningCliHold):
+                issue_from_cli_request("permit_authority", request, context=context)
+            self.assertEqual(params["journal"].snapshot().sequence, 0)
+
+    def test_execution_authorization_check_verifies_real_go_and_revocation_signatures(self):
+        from copy import deepcopy
+        from datetime import timedelta
+        from f4_go_gate import F4_SOURCE_PATHS, build_f4_go_candidate
+        from f4_cycle_runtime import execution_authorization_check, F4RuntimeHold
+        workspace = Path(self.temporary.name) / "go-workspace"
+        for path in F4_SOURCE_PATHS:
+            target = workspace / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"test-only exact source bytes")
+        instant = datetime.now(timezone.utc)
+        def stamp(value):
+            return value.isoformat().replace("+00:00", "Z")
+        draft = build_f4_go_candidate(workspace=workspace, base_sha=BASE_SHA,
+            approval_id="test-connection-go", not_before=stamp(instant - timedelta(minutes=1)),
+            expires_at=stamp(instant + timedelta(minutes=10)), revocation_sequence=1)
+        candidate = {**draft, "state": "SIGNED_GO", "approvals": {
+            role: sign_envelope(key_id=role + "-key", private_key=self.keys[role], payload=draft["payload"])
+            for role in ("owner_a", "owner_b")}}
+        payload = {"schema": 1, "kind": "F4_REVOCATION_STATUS", "repository_id": REPOSITORY_ID,
+                   "approval_id": "test-connection-go", "go_sha256": hashlib.sha256(canonical_json(candidate)).hexdigest(),
+                   "sequence": 1, "status": "ACTIVE", "valid_from": stamp(instant - timedelta(minutes=1)),
+                   "valid_until": stamp(instant + timedelta(minutes=5))}
+        status = {"payload": payload, "approvals": {
+            role: sign_envelope(key_id=role + "-key", private_key=self.keys[role], payload=payload)
+            for role in ("owner_a", "owner_b")}}
+        source = [status]
+        kwargs = dict(candidate=candidate, workspace=workspace, expected_base_sha=BASE_SHA, trusted_keys=self.trusted_keys)
+        check = execution_authorization_check(**kwargs, read_signed_revocation=lambda: source[0])
+        self.assertTrue(check())
+        source[0] = deepcopy(status)
+        source[0]["payload"]["status"] = "REVOKED"
+        self.assertFalse(check())
+        source[0] = None
+        self.assertFalse(check())
+        source[0] = status
+        (workspace / F4_SOURCE_PATHS[0]).write_bytes(b"changed after GO")
+        self.assertFalse(check())
+        with self.assertRaises(F4RuntimeHold):
+            execution_authorization_check(**kwargs, read_signed_revocation=None)
+
     def _delegation_case(self):
         """Build an ephemeral, real-Ed25519 test delegation and candidate."""
         verified_bundle = self.verify()

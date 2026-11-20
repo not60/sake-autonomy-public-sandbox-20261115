@@ -185,6 +185,174 @@ class F4CycleControlTests(unittest.TestCase):
             "expired": False,
         }
 
+    def _read_claim(self, cycle, run_id, state, mutate=None):
+        from unittest.mock import Mock
+        from test_github_worker_provenance import WorkerArtifactProvenanceTests, response
+        fixture = WorkerArtifactProvenanceTests(); fixture.setUp()
+        fixture.manifest["worker_run_id"] = run_id
+        api_id, attempt, _word, number = run_id.split("-")
+        fixture.run.update(id=int(api_id), run_attempt=int(attempt), head_sha="b" * 40)
+        fixture.artifacts["artifacts"][0]["workflow_run"].update(id=int(api_id), head_sha="b" * 40)
+        receipt = {"repository_id": 1458303357, "cycle": cycle, "run_id": run_id,
+                   "source_commit_sha": "b" * 40, "go_sha256": state.go_sha256,
+                   "journal_sequence": state.sequence, "journal_head_sha256": state.head_sha256,
+                   "journal_version": state.version}
+        receipt.update(mutate or {})
+        revision = self.backend.revision
+        result = self.control.verify_worker_claim(
+            candidate=self.candidate, go=self.go, receipt=receipt, manifest=fixture.manifest,
+            expected_cycle=cycle, expected_run_id=run_id, expected_execution_sha="b" * 40,
+            github_read_token="test-only", now=NOW,
+            github_opener=Mock(side_effect=[response(fixture.run), response(fixture.artifacts)]))
+        self.assertEqual(self.backend.revision, revision)
+        return result
+
+    def test_worker_claim_readback_is_readonly_and_rejects_tampered_receipt(self):
+        state = self.control.claim_cycle(candidate=self.candidate, go=self.go,
+            cycle_number=1, run_id="12345-2-cycle-1", source_commit_sha="b" * 40, now=NOW)
+        self.assertEqual(self._read_claim(1, "12345-2-cycle-1", state).cycle, 1)
+        for change in ({"run_id": "999-1-cycle-1"}, {"journal_head_sha256": "0" * 64},
+                       {"cycle": 2}, {"source_commit_sha": "c" * 40}, {"go_sha256": "d" * 64}):
+            with self.subTest(change=change), self.assertRaises(CycleControlHold):
+                self._read_claim(1, "12345-2-cycle-1", state, change)
+        before = self.backend.revision
+        with self.assertRaises(CycleControlHold):
+            self.control.claim_cycle(candidate=self.candidate, go=self.go,
+                cycle_number=1, run_id="12345-2-cycle-1", source_commit_sha="b" * 40, now=NOW)
+        self.assertEqual(self.backend.revision, before)
+
+    def _finite_fixture(self, *, stop_ok=True, audit_ok=True, bad_claim=False, replay_audit=False, final_stop_missing=False):
+        import f4_limited_delegation as delegation
+        from attestations import sign_envelope
+        from f4_auditor_artifact import sign_cycle2_audit
+        observer = TrustedVerificationKey("stop-fixture", "stop_observer",
+                                          self.keys.public_keys["permit_authority"])
+        scope = {"executor": "fixture", "process_namespace": "fixture-processes",
+                 "continuation_namespace": "fixture-queue"}
+        signer = type("TestSigner", (), {"sign": lambda _self, msg: self.auditor_test_keys.sign("witness", msg)})()
+        calls = []; states = {}; stopped = []
+        artifact = self._artifact()
+        payload = {**artifact["payload"], "worker_run_id": "12345-2-cycle-1"}
+        artifact = build_cycle1_auditor_artifact(payload=payload, key_id=self.auditor_key.key_id,
+            private_key=type("TestSigner", (), {"sign": lambda _self, msg: self.auditor_test_keys.sign("witness", msg)})())
+        def stage(cycle, name):
+            calls.append((cycle, name))
+            if name == "worker":
+                run_id = f"{12344 + cycle}-2-cycle-{cycle}"
+                states[cycle] = self.control.claim_cycle(candidate=self.candidate, go=self.go,
+                    cycle_number=cycle, run_id=run_id, source_commit_sha="b" * 40, now=NOW,
+                    cycle1_auditor_artifact=artifact if cycle == 2 else None,
+                    verify_github_artifact=self._provenance if cycle == 2 else None)
+                return run_id
+            if cycle == 1:
+                self.control.record_cycle1_auditor_pass(candidate=self.candidate, go=self.go,
+                    artifact=artifact, verify_github_artifact=self._provenance, now=NOW)
+                return artifact
+            if replay_audit:
+                return artifact
+            return sign_cycle2_audit(key_id=self.auditor_key.key_id, private_key=signer,
+                payload={**payload, "schema": 2, "cycle_number": 2,
+                         "worker_run_id": "12346-2-cycle-2", "workflow_run_id": "102",
+                         "auditor_run_id": "102:1:auditor", "permit_id": "permit-cycle2",
+                         "readonly_ci_run_id": "ci-102", "permit_sha256": "a" * 64,
+                         "cycle1_audit_sha256": hashlib.sha256(canonical_json(artifact)).hexdigest()})
+        def verify(cycle, run_id):
+            if bad_claim:
+                return True
+            return self._read_claim(cycle, run_id, states[cycle])
+        def audit(_cycle, claim, envelope, previous):
+            fields = ("worker_run_id", "go_sha256", "pr_number", "pr_head_sha", "pr_base_sha",
+                      "pr_state", "pr_is_draft", "pr_merged", "readonly_ci_run_id", "readonly_ci_conclusion",
+                      "permit_id", "candidate_digest", "witness_digest", "journal_revision", "journal_head_sha256",
+                      "permit_sha256")
+            # Fixed fixture values from the independently prepared stage envelope.
+            readback = {key: envelope["payload"][key] for key in fields if key in envelope["payload"]}
+            return self.control.verify_stage_audit(candidate=self.candidate, go=self.go,
+                claim=claim, artifact=envelope, previous=previous, verify_github_artifact=self._provenance,
+                read_verified_publication=lambda *_: readback, now=NOW)
+
+        def stop(cycle, _receipt, audit):
+            if not stop_ok or (cycle == 2 and final_stop_missing):
+                return True  # Unsigned claims are rejected even when truthy.
+            observation = {
+                "schema": 1, "kind": "F4_SAFE_STOP", "repository_id": 1458303357,
+                "cycle": cycle, "worker_run_id": audit.claim.run_id, "audit_run_id": audit.workflow_run_id,
+                "audit_run_attempt": audit.run_attempt, "source_commit_sha": audit.claim.source_commit_sha,
+                "go_sha256": audit.claim.go_sha256, "audit_sha256": audit.envelope_sha256,
+                "observation_scope": scope, "execution_terminated": True, "live_processes": [],
+                "pending_executions": [], "observed_at": NOW.isoformat().replace("+00:00", "Z"),
+            }
+            key = type("TestStopSigner", (), {"sign": lambda _self, msg: self.keys.sign("permit_authority", msg)})()
+            envelope = sign_envelope(key_id=observer.key_id, private_key=key, payload=observation)
+            if cycle == 2:
+                from copy import deepcopy
+                tampered = deepcopy(envelope)
+                tampered["payload"]["observed_at"] = "2026-11-18T03:00:00.1Z"
+                with self.assertRaises(CycleControlHold):
+                    f4_cycle_control.verify_safe_stop(envelope=tampered, audit=audit,
+                        observer_key=observer, expected_scope=scope, now=NOW)
+            return f4_cycle_control.verify_safe_stop(envelope=envelope, audit=audit,
+                observer_key=observer, expected_scope=scope, now=NOW)
+
+        kwargs = dict(check_revocation=lambda _cycle: True, verify_worker_result=verify,
+                      verify_stage_result=audit, verify_cycle_safe_stop=stop,
+                      execute_stage=stage, verify_cycle1_audit=lambda _receipt: audit_ok,
+                      safe_stop=lambda: stopped.append("stop") or True)
+        return delegation, kwargs, calls, stopped
+
+    def test_finite_worker_owns_both_claims_without_coordinator_write(self):
+        delegation, kwargs, calls, stopped = self._finite_fixture()
+        result = delegation.execute_finite_two_cycles(**kwargs)
+        self.assertEqual(result.cycles_completed, 2)
+        self.assertEqual(calls, [(1, "worker"), (1, "publish-audit"), (2, "worker"), (2, "publish-audit")])
+        claims, _ = f4_cycle_control._cycle_history(self.control.read().events)
+        self.assertEqual(len(claims), 2); self.assertEqual(stopped, ["stop"])
+
+    def test_unverified_claim_blocks_publisher_without_retry(self):
+        delegation, kwargs, calls, stopped = self._finite_fixture(bad_claim=True)
+        with self.assertRaisesRegex(delegation.DelegationHold, "worker_claim_receipt_unverified"):
+            delegation.execute_finite_two_cycles(**kwargs)
+        self.assertEqual(calls, [(1, "worker")]); self.assertEqual(stopped, ["stop"])
+
+    def test_ambiguous_worker_result_is_not_retried(self):
+        delegation, kwargs, calls, stopped = self._finite_fixture()
+        original = kwargs["execute_stage"]
+        def unknown(cycle, stage):
+            original(cycle, stage)
+            raise TimeoutError("test-only lost Worker result after claim")
+        kwargs["execute_stage"] = unknown
+        with self.assertRaisesRegex(delegation.DelegationHold, "worker_execution_or_claim_unverified_no_retry"):
+            delegation.execute_finite_two_cycles(**kwargs)
+        self.assertEqual(calls, [(1, "worker")]); self.assertEqual(stopped, ["stop"])
+        claims, _ = f4_cycle_control._cycle_history(self.control.read().events)
+        self.assertEqual(len(claims), 1)
+
+    def test_cycle2_blocked_without_authenticated_cycle1_audit(self):
+        delegation, kwargs, calls, stopped = self._finite_fixture(audit_ok=False)
+        with self.assertRaisesRegex(delegation.DelegationHold, "cycle1_independent_audit_not_passed"):
+            delegation.execute_finite_two_cycles(**kwargs)
+        self.assertNotIn((2, "worker"), calls); self.assertEqual(stopped, ["stop"])
+
+    def test_final_stop_requires_authenticated_observation(self):
+        delegation, kwargs, calls, stopped = self._finite_fixture(final_stop_missing=True)
+        with self.assertRaisesRegex(delegation.DelegationHold, "cycle_safe_stop_unverified"):
+            delegation.execute_finite_two_cycles(**kwargs)
+        self.assertEqual(calls[-1], (2, "publish-audit"))
+        self.assertEqual(stopped, ["stop"])
+
+    def test_cycle2_cannot_reuse_cycle1_audit(self):
+        delegation, kwargs, calls, stopped = self._finite_fixture(replay_audit=True)
+        with self.assertRaisesRegex(delegation.DelegationHold, "finite_stage_failed_no_retry"):
+            delegation.execute_finite_two_cycles(**kwargs)
+        self.assertEqual(calls[-1], (2, "publish-audit"))
+        self.assertEqual(stopped, ["stop"])
+
+    def test_cycle2_blocked_without_verified_cycle1_stop(self):
+        delegation, kwargs, calls, stopped = self._finite_fixture(stop_ok=False)
+        with self.assertRaisesRegex(delegation.DelegationHold, "cycle_safe_stop_unverified"):
+            delegation.execute_finite_two_cycles(**kwargs)
+        self.assertNotIn((2, "worker"), calls); self.assertEqual(stopped, ["stop"])
+
     def test_cycle1_auditor_artifact_pass_enables_cycle2_once(self) -> None:
         state = self.control.claim_cycle(
             candidate=self.candidate, go=self.go, cycle_number=1,

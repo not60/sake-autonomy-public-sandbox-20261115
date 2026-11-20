@@ -239,43 +239,15 @@ class LimitedDelegationTests(unittest.TestCase):
                 ), now=NOW,
             )
 
-    def test_finite_two_cycle_sequence_stops_on_missing_cycle1_audit(self):
+    def test_finite_control_requires_read_only_verifier_adapters(self):
         calls = []
-        stops = []
-        result = delegation.execute_finite_two_cycles(
-            check_revocation=lambda cycle: calls.append(("revoke", cycle)) or True,
-            atomic_claim=lambda cycle: calls.append(("claim", cycle)) or True,
-            execute_stage=lambda cycle, stage: calls.append((cycle, stage)) or (cycle, stage),
-            verify_cycle1_audit=lambda receipt: receipt == (1, "publish-audit"),
-            safe_stop=lambda: stops.append("stop") or True,
-        )
-        self.assertEqual(result.cycles_completed, 2)
-        self.assertEqual(len(result.stage_receipts), 4)
-        self.assertEqual(stops, ["stop"])
-        self.assertEqual([item for item in calls if isinstance(item[0], int)],
-                         [(1, "worker"), (1, "publish-audit"), (2, "worker"), (2, "publish-audit")])
-
-        calls.clear()
-        with self.assertRaisesRegex(delegation.DelegationHold, "cycle1_independent_audit_not_passed"):
+        with self.assertRaisesRegex(delegation.DelegationHold, "finite_execution_adapter_missing"):
             delegation.execute_finite_two_cycles(
-                check_revocation=lambda _cycle: True,
-                atomic_claim=lambda _cycle: True,
-                execute_stage=lambda cycle, stage: calls.append((cycle, stage)) or (cycle, stage),
-                verify_cycle1_audit=lambda _receipt: False,
-                safe_stop=lambda: True,
-            )
-        self.assertNotIn((2, "worker"), calls)
-
-        stopped = []
-        with self.assertRaisesRegex(delegation.DelegationHold, "safe_stop_failed_after_cycle2"):
-            delegation.execute_finite_two_cycles(
-                check_revocation=lambda _cycle: True,
-                atomic_claim=lambda _cycle: True,
-                execute_stage=lambda cycle, stage: (cycle, stage),
-                verify_cycle1_audit=lambda _receipt: True,
-                safe_stop=lambda: stopped.append(True) or False,
-            )
-        self.assertEqual(stopped, [True])
+                check_revocation=lambda _cycle: True, verify_worker_result=None,
+                verify_stage_result=None, verify_cycle_safe_stop=None,
+                execute_stage=lambda cycle, stage: calls.append((cycle, stage)),
+                verify_cycle1_audit=None, safe_stop=lambda: True)
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

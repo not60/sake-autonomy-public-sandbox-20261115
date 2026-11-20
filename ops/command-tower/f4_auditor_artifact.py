@@ -233,5 +233,14 @@ def main() -> int:
     return 0
 
 
+
+def sign_cycle2_audit(*, payload, key_id, private_key):
+    """Sign the Cycle2 contract after protected Auditor readback."""
+    from attestations import sign_envelope
+    from f4_cycle_control import _validate_audit_payload
+
+    _validate_audit_payload(payload, cycle=2)
+    return sign_envelope(key_id=key_id, private_key=private_key, payload=dict(payload))
+
 if __name__ == "__main__":
     raise SystemExit(main())

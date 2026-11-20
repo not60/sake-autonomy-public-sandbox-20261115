@@ -409,7 +409,9 @@ def verify_auditor_candidate_authorization(*, delegation_envelope: object,
 
 
 def execute_finite_two_cycles(*, check_revocation: Callable[[int], bool] | None,
-                              atomic_claim: Callable[[int], bool] | None,
+                              verify_worker_result: Callable[[int, object], object] | None,
+                              verify_stage_result: Callable[[int, object, object, object], object] | None,
+                              verify_cycle_safe_stop: Callable[[int, object, object], object] | None,
                               execute_stage: Callable[[int, str], object] | None,
                               verify_cycle1_audit: Callable[[object], bool] | None,
                               safe_stop: Callable[[], bool] | None) -> FiniteExecutionResult:
@@ -417,15 +419,19 @@ def execute_finite_two_cycles(*, check_revocation: Callable[[int], bool] | None,
 
     This is an injected candidate coordinator only. The Cycle 1 verifier must
     authenticate both the independent audit PASS and its SAFE STOP receipt.
+    Worker result verifier must return a CAS/provenance-verified sealed claim.
+    Stage verifier must authenticate signatures/CI/independent audit; stop verifier
+    must authenticate the actual stop receipt, not a plain result flag.
     Missing real adapters fail closed; no network, workflow dispatch, or Worker
     is started here.
     """
-    if any(callback is None for callback in
-           (check_revocation, atomic_claim, execute_stage, safe_stop)):
+    if any(not callable(callback) for callback in
+           (check_revocation, verify_worker_result, verify_stage_result,
+            verify_cycle_safe_stop, verify_cycle1_audit, execute_stage, safe_stop)):
         raise DelegationHold("finite_execution_adapter_missing")
     receipts: list[object] = []
     cycles_completed = 0
-    audit_ok = False
+    previous_audit = None
     try:
         for cycle in (1, 2):
             try:
@@ -434,22 +440,40 @@ def execute_finite_two_cycles(*, check_revocation: Callable[[int], bool] | None,
                 active = False
             if active is not True:
                 raise DelegationHold("revocation_not_active_before_cycle")
+            # execute_stage(worker) owns the only claim write, before Codex.
+            # No retry on ambiguous launch, claim, transport or execution outcomes.
+            from f4_cycle_control import (
+                is_verified_safe_stop, is_verified_stage_audit, is_verified_worker_claim,
+            )
             try:
-                claimed = atomic_claim(cycle)  # type: ignore[misc]
+                worker_receipt = execute_stage(cycle, "worker")
+                claim = verify_worker_result(cycle, worker_receipt)
             except Exception:
-                claimed = False
-            if claimed is not True:
-                raise DelegationHold("cycle_claim_failed_no_retry")
-            cycle_receipts: list[object] = []
-            for stage in FINITE_STAGES:
-                try:
-                    receipt = execute_stage(cycle, stage)  # type: ignore[misc]
-                except Exception:
-                    raise DelegationHold("finite_stage_failed_no_retry") from None
-                if receipt is None:
-                    raise DelegationHold("finite_stage_receipt_missing")
-                cycle_receipts.append(receipt)
-                receipts.append(receipt)
+                raise DelegationHold("worker_execution_or_claim_unverified_no_retry") from None
+            if not is_verified_worker_claim(claim) or claim.cycle != cycle:
+                raise DelegationHold("worker_claim_receipt_unverified")
+            if cycle == 2 and (claim.run_id == previous_claim.run_id
+                    or claim.source_commit_sha != previous_claim.source_commit_sha
+                    or claim.go_sha256 != previous_claim.go_sha256
+                    or claim.journal_sequence <= previous_claim.journal_sequence):
+                raise DelegationHold("worker_claim_continuity_mismatch")
+            previous_claim = claim
+            receipts.append(worker_receipt)
+            try:
+                receipt = execute_stage(cycle, "publish-audit")
+                audit = verify_stage_result(cycle, claim, receipt, previous_audit)
+            except Exception:
+                raise DelegationHold("finite_stage_failed_no_retry") from None
+            if receipt is None or not is_verified_stage_audit(audit, claim, previous_audit):
+                raise DelegationHold("publisher_signatures_or_audit_unverified")
+            receipts.append(receipt)
+            cycle_receipts = [worker_receipt, receipt]
+            try:
+                stopped = verify_cycle_safe_stop(cycle, receipt, audit)
+            except Exception:
+                stopped = False
+            if not is_verified_safe_stop(stopped, audit):
+                raise DelegationHold("cycle_safe_stop_unverified")
             if cycle == 1:
                 if verify_cycle1_audit is None:
                     raise DelegationHold("cycle1_independent_audit_verifier_missing")
@@ -459,9 +483,8 @@ def execute_finite_two_cycles(*, check_revocation: Callable[[int], bool] | None,
                     audit_ok = False
                 if not audit_ok:
                     raise DelegationHold("cycle1_independent_audit_not_passed")
+            previous_audit = audit
             cycles_completed += 1
-        if not audit_ok:
-            raise DelegationHold("cycle1_independent_audit_not_passed")
     except Exception as exc:
         stop_ok = _safe_stop(safe_stop)
         if not stop_ok:

@@ -506,6 +506,10 @@ def read_verified_publication(*, gate: PublisherGate, github_api, expected_head_
                               bundle: Mapping[str, object]) -> dict[str, object]:
     """Independently read the signed inputs, Permit journal, pinned PR bytes and CI."""
     result = gate.audit_bundle(**bundle)
+    return _read_publication(result, github_api, expected_head_sha)
+
+
+def _read_publication(result, github_api, expected_head_sha):
     if (result.repository_id != PUBLIC_REPOSITORY_ID
             or result.audit_journal_revision is None or result.audit_journal_head_sha256 is None):
         raise PublisherGateHold("publication_audit_snapshot_missing")
@@ -589,6 +593,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="required pinned PR base for read-only CI evidence")
     parser.add_argument("--f4-audit-evidence-output", default="",
                         help="write read-only structured evidence after the exact PR/CI audit passes")
+    parser.add_argument("--f4-workspace")
+    parser.add_argument("--f4-candidate")
+    parser.add_argument("--f4-revocation")
+    parser.add_argument("--f4-auditor-key")
+    parser.add_argument("--f4-worker-run-id")
+    parser.add_argument("--f4-execution-sha")
+    parser.add_argument("--f4-cycle", type=int, choices=(1, 2))
+    parser.add_argument("--f4-claim-receipt")
     args = parser.parse_args(argv)
     from draft_pr_writer import DraftPrWriter, GitHubDraftPrApi, WriterHold
 
@@ -623,6 +635,27 @@ def main(argv: list[str] | None = None) -> int:
         if not args.cas_endpoint or not token:
             raise PublisherGateHold("external_cas_credentials_not_configured")
         manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+        if args.role == "publisher":
+            from f4_cycle_runtime import execute
+
+            if (args.repository_id != PUBLIC_REPOSITORY_ID or not isinstance(manifest, dict)
+                    or not all((args.f4_workspace, args.f4_candidate, args.f4_revocation,
+                                args.f4_auditor_key, args.f4_worker_run_id, args.f4_execution_sha,
+                                args.f4_cycle, args.f4_claim_receipt))):
+                raise PublisherGateHold("publisher_worker_claim_inputs_missing")
+            try:
+                verified = execute(
+                    operation="verify-worker-receipt", workspace=args.f4_workspace,
+                    expected_base_sha=args.base_sha, candidate_path=args.f4_candidate,
+                    revocation_path=args.f4_revocation, trusted_keys_path=args.trusted_keys,
+                    auditor_key_path=args.f4_auditor_key, cycle=args.f4_cycle,
+                    run_id=args.f4_worker_run_id, source_commit_sha=args.f4_execution_sha,
+                    claim_receipt_path=args.f4_claim_receipt, worker_manifest=manifest,
+                )
+            except Exception:
+                raise PublisherGateHold("publisher_worker_claim_unverified") from None
+            if type(verified) is not int or verified != 0:
+                raise PublisherGateHold("publisher_worker_claim_unverified")
         permit = json.loads(Path(args.permit).read_text(encoding="utf-8"))
         witness = json.loads(Path(args.witness).read_text(encoding="utf-8"))
         approvals = json.loads(Path(args.owner_approvals).read_text(encoding="utf-8"))
@@ -673,27 +706,13 @@ def main(argv: list[str] | None = None) -> int:
             if ci_result.status != "completed" or ci_result.conclusion != "success":
                 raise WriterHold("readonly_ci_not_success")
             if args.f4_audit_evidence_output:
-                pr = github_api.get_open_draft_pull_request(
-                    PUBLIC_REPOSITORY_ID, PUBLIC_HEAD_BRANCH, PUBLIC_BASE_BRANCH,
-                )
-                snapshot = journal.snapshot()
-                if (pr.number != args.pull_request_number
-                        or pr.head_sha != args.expected_pr_head_sha
-                        or pr.base_sha != args.expected_pr_base_sha
-                        or pr.draft is not True):
-                    raise WriterHold("f4_audit_pr_readback_mismatch")
+                evidence = _read_publication(result, github_api, args.expected_pr_head_sha)
+                if evidence["readonly_ci_run_id"] != str(ci_result.run_id):
+                    raise WriterHold("f4_audit_ci_changed_during_readback")
+                del evidence["permit_sha256"]  # Keep the existing Cycle1 schema.
                 _write_f4_audit_evidence(args.f4_audit_evidence_output, {
-                    "schema": 1, "repository_id": result.repository_id,
-                    "base_sha": result.base_sha, "worker_run_id": result.worker_run_id,
-                    "candidate_digest": result.candidate_digest, "permit_id": result.permit_id,
-                    "witness_digest": result.witness_digest,
-                    "journal_revision": snapshot.sequence,
-                    "journal_head_sha256": snapshot.head_sha256,
-                    "pr_number": pr.number, "pr_state": "open",
-                    "pr_is_draft": True, "pr_merged": False,
-                    "pr_head_sha": pr.head_sha, "pr_base_sha": pr.base_sha,
-                    "readonly_ci_run_id": str(ci_result.run_id),
-                    "readonly_ci_conclusion": ci_result.conclusion,
+                    **evidence, "schema": 1, "repository_id": result.repository_id,
+                    "base_sha": result.base_sha,
                 })
     except WriterHold as exc:
         print(f"HOLD:{exc.reason}", file=sys.stderr)

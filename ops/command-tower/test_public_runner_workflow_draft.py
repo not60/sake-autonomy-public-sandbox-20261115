@@ -93,8 +93,17 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         self.assertNotIn('test "${{ inputs.f4_cycle }}"', source)
         self.assertIn('--base-sha "$F4_BASE_SHA"', source)
         self.assertIn('--worker-run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-cycle-$F4_CYCLE"', source)
-        self.assertEqual(source.count('expected_execution_sha=os.environ["EXPECTED_EXECUTION_SHA"]'), 2)
-        self.assertEqual(source.count('expected_cycle=int(os.environ["F4_CYCLE"])'), 2)
+        publisher = section(source, "publisher", "auditor")
+        auditor = source[source.index("  auditor:\n"):]
+        for job in (publisher, auditor):
+            self.assertIn("name: b09-f4-worker-claim-receipt", job)
+            self.assertIn('${{ inputs.worker_run_id }}', job)
+        for flag, value in (("execution-sha", "EXPECTED_EXECUTION_SHA"),
+                            ("cycle", "F4_CYCLE"), ("worker-run-id", "WORKER_RUN_ID")):
+            self.assertIn(f'--f4-{flag} "${value}"', publisher)
+        self.assertLess(publisher.index('--f4-claim-receipt '), publisher.index('--draft-pr-write '))
+        self.assertIn('--source-commit-sha "$EXPECTED_EXECUTION_SHA"', auditor)
+        self.assertIn('--cycle "$F4_CYCLE"', auditor)
         self.assertIn("test \"$F4_CYCLE\" = '2'", source)
 
     def test_publisher_writer_is_connected_but_remains_hard_disabled(self) -> None:

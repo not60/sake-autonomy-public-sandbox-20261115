@@ -215,6 +215,14 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Transfer immutable Worker claim receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: b09-f4-worker-claim-receipt
+          path: ${{ runner.temp }}/f4-worker-claim-receipt.json
+          if-no-files-found: error
+          retention-days: 1
+
   publisher:
     outputs:
       pr_number: ${{ steps.publish.outputs.pr_number }}
@@ -248,28 +256,43 @@ jobs:
           set -euo pipefail
           [[ "${WORKER_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: completed Worker run ID missing.' >&2; exit 78; }
           [[ "${ATTESTATION_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: signed Publisher bundle run ID missing.' >&2; exit 78; }
-      - name: Materialize externally managed Publisher trust roots without logging them
+      - name: Download externally signed F4 approval bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-formal-go-approval
+          path: ${{ runner.temp }}/b09-f4-go
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.f4_go_approval_run_id }}
+          github-token: ${{ github.token }}
+      - name: Materialize externally managed F4 trust roots without logging them
         env:
           B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
+          B09_F4_AUDITOR_KEY_JSON: ${{ vars.B09_F4_AUDITOR_KEY_JSON }}
         run: |
           set -euo pipefail
           python - <<'PY'
           import json, os, sys
           from pathlib import Path
           sys.path.insert(0, str(Path.cwd() / "ops/command-tower"))
+          from f4_cycle_runtime import _load_auditor_key
           from trusted_key_registry import load_trusted_verification_keys
-          raw = os.environ.get("B09_F4_TRUSTED_KEYS_JSON", "")
-          if not raw:
-              raise SystemExit("HOLD: externally managed Publisher trust roots are not configured.")
+          owner_raw = os.environ.get("B09_F4_TRUSTED_KEYS_JSON", "")
+          auditor_raw = os.environ.get("B09_F4_AUDITOR_KEY_JSON", "")
+          if not owner_raw or not auditor_raw:
+              raise SystemExit("HOLD: externally managed F4 trust roots are not configured.")
           try:
-              load_trusted_verification_keys(json.loads(raw))
+              owner = json.loads(owner_raw)
+              auditor = json.loads(auditor_raw)
+              keys = load_trusted_verification_keys(owner)
+              _load_auditor_key(auditor, keys)
           except Exception:
-              raise SystemExit("HOLD: externally managed Publisher trust roots are invalid.") from None
+              raise SystemExit("HOLD: externally managed F4 trust roots are invalid.") from None
           root = Path(os.environ["RUNNER_TEMP"]) / "b09-f4-trust"
           root.mkdir(mode=0o700, parents=True, exist_ok=True)
-          fd = os.open(root / "trusted-keys.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-          with os.fdopen(fd, "w", encoding="utf-8") as stream:
-              stream.write(raw)
+          for name, raw in (("trusted-keys.json", owner_raw), ("auditor-key.json", auditor_raw)):
+              fd = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                  stream.write(raw)
           PY
       - name: Download worker bytes
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -287,32 +310,22 @@ jobs:
           repository: not60/sake-autonomy-public-sandbox-20261115
           run-id: ${{ inputs.publisher_attestation_run_id }}
           github-token: ${{ github.token }}
-      - name: Verify completed Worker run and immutable artifact provenance
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          WORKER_RUN_ID: ${{ inputs.worker_run_id }}
-          EXPECTED_BASE_SHA: ${{ inputs.f4_base_sha }}
-          EXPECTED_EXECUTION_SHA: ${{ github.sha }}
-          F4_CYCLE: ${{ inputs.f4_cycle }}
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json, os, sys
-          from pathlib import Path
-          sys.path.insert(0, str(Path.cwd() / "ops/command-tower"))
-          from github_worker_provenance import verify_worker_artifact_provenance
-          manifest = json.loads((Path(os.environ["RUNNER_TEMP"]) / "b09-bundle/manifest.json").read_text(encoding="utf-8"))
-          verify_worker_artifact_provenance(
-              manifest, expected_run_id=os.environ["WORKER_RUN_ID"],
-              expected_base_sha=os.environ["EXPECTED_BASE_SHA"],
-              expected_execution_sha=os.environ["EXPECTED_EXECUTION_SHA"],
-              expected_cycle=int(os.environ["F4_CYCLE"]),
-              bearer_token=os.environ.get("GITHUB_TOKEN", ""),
-          )
-          PY
+      - name: Download immutable Worker claim receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-worker-claim-receipt
+          path: ${{ runner.temp }}/b09-f4-claim
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.worker_run_id }}
+          github-token: ${{ github.token }}
       - name: Verify exact bytes, Permit, Witness, and durable single use
         id: publish
         env:
+          GITHUB_TOKEN: ${{ github.token }}
+          B09_F4_CONTROL_V2_READ_BEARER: ${{ secrets.B09_F4_CONTROL_V2_READ_BEARER }}
+          WORKER_RUN_ID: ${{ inputs.worker_run_id }}
+          EXPECTED_EXECUTION_SHA: ${{ github.sha }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
           PUBLISHER_ATTESTATION_RUN_ID: ${{ inputs.publisher_attestation_run_id }}
           F4_BASE_SHA: ${{ inputs.f4_base_sha }}
           B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
@@ -362,6 +375,14 @@ jobs:
             --base-sha "$F4_BASE_SHA" \
             --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
             --role publisher \
+            --f4-workspace "$GITHUB_WORKSPACE" \
+            --f4-candidate "$RUNNER_TEMP/b09-f4-go/candidate.json" \
+            --f4-revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
+            --f4-auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
+            --f4-worker-run-id "$WORKER_RUN_ID" \
+            --f4-execution-sha "$EXPECTED_EXECUTION_SHA" \
+            --f4-cycle "$F4_CYCLE" \
+            --f4-claim-receipt "$RUNNER_TEMP/b09-f4-claim/f4-worker-claim-receipt.json" \
             --draft-pr-write \
             "${args[@]}")"
           printf '%s\n' "$result"
@@ -450,6 +471,14 @@ jobs:
           repository: not60/sake-autonomy-public-sandbox-20261115
           run-id: ${{ inputs.publisher_attestation_run_id }}
           github-token: ${{ github.token }}
+      - name: Download immutable Worker claim receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-worker-claim-receipt
+          path: ${{ runner.temp }}/b09-f4-claim
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.worker_run_id }}
+          github-token: ${{ github.token }}
       - name: Independently verify completed Worker run and artifact provenance
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -457,22 +486,20 @@ jobs:
           EXPECTED_BASE_SHA: ${{ inputs.f4_base_sha }}
           EXPECTED_EXECUTION_SHA: ${{ github.sha }}
           F4_CYCLE: ${{ inputs.f4_cycle }}
+          B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
+          B09_F4_CONTROL_V2_READ_BEARER: ${{ secrets.B09_F4_CONTROL_V2_READ_BEARER }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import json, os, sys
-          from pathlib import Path
-          sys.path.insert(0, str(Path.cwd() / "ops/command-tower"))
-          from github_worker_provenance import verify_worker_artifact_provenance
-          manifest = json.loads((Path(os.environ["RUNNER_TEMP"]) / "b09-bundle/manifest.json").read_text(encoding="utf-8"))
-          verify_worker_artifact_provenance(
-              manifest, expected_run_id=os.environ["WORKER_RUN_ID"],
-              expected_base_sha=os.environ["EXPECTED_BASE_SHA"],
-              expected_execution_sha=os.environ["EXPECTED_EXECUTION_SHA"],
-              expected_cycle=int(os.environ["F4_CYCLE"]),
-              bearer_token=os.environ.get("GITHUB_TOKEN", ""),
-          )
-          PY
+          python ops/command-tower/f4_cycle_runtime.py \
+            --operation verify-worker-receipt --workspace "$GITHUB_WORKSPACE" \
+            --expected-base-sha "$EXPECTED_BASE_SHA" --source-commit-sha "$EXPECTED_EXECUTION_SHA" \
+            --cycle "$F4_CYCLE" --run-id "$WORKER_RUN_ID" \
+            --candidate "$RUNNER_TEMP/b09-f4-go/candidate.json" \
+            --revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
+            --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
+            --auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
+            --worker-manifest "$RUNNER_TEMP/b09-bundle/manifest.json" \
+            --claim-receipt "$RUNNER_TEMP/b09-f4-claim/f4-worker-claim-receipt.json"
       - name: Independently verify hashes and signed attestations
         env:
           B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}

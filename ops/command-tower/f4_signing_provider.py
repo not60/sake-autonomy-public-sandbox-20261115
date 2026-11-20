@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import replace
+from pathlib import Path
 import sys
 from typing import Mapping
 
@@ -282,6 +283,35 @@ def write_signature_artifact(*, output, role, envelope, trusted_key):
         os.fsync(stream.fileno())
     import hashlib
     return hashlib.sha256(data).hexdigest()
+
+
+def launch_signing_role(*, role, environment, role_keys, encoded_private_key,
+                        request, output, verification_inputs):
+    """Protected in-process launcher entry for any of the four signing roles.
+
+    The caller owns the request stream, output directory, and authenticated
+    verification inputs. Nothing is loaded from a module named by the request.
+    """
+    import io
+    import json
+
+    target = Path(output)
+    if (role not in ROLE_ENVIRONMENTS or environment != ROLE_ENVIRONMENTS[role]
+            or target.name != role + ".json" or not target.parent.is_dir()
+            or target.exists() or target.is_symlink()):
+        raise SigningCliHold("protected_launcher_role_or_output_invalid")
+    template = build_verification_context(role=role, **verification_inputs)
+    signed = io.StringIO()
+    status = run_trusted_role(
+        role=role, environment=environment, template=template, role_keys=role_keys,
+        encoded_private_key=encoded_private_key, stdin=request, stdout=signed,
+    )
+    if status != 0:
+        raise SigningCliHold("protected_launcher_signing_held")
+    return write_signature_artifact(
+        output=target, role=role, envelope=json.loads(signed.getvalue()),
+        trusted_key=role_keys[role],
+    )
 
 
 if __name__ == "__main__":

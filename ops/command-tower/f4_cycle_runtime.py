@@ -22,6 +22,7 @@ CAS_ENDPOINT = "https://bkpofcpaefkocykvtsjv.supabase.co/functions/v1/sake-cas-v
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _ROLE_TOKEN = {
+    "verify-worker-receipt": "B09_F4_CONTROL_V2_READ_BEARER",
     "initialize": "B09_F4_CONTROL_V2_OWNER_BEARER",
     "claim-cycle1": "B09_F4_CONTROL_V2_WORKER_BEARER",
     "record-cycle1-audit": "B09_F4_CONTROL_V2_AUDITOR_BEARER",
@@ -100,7 +101,9 @@ def execute(*, operation: str, workspace: str | Path, expected_base_sha: str,
             auditor_artifact_path: str | Path | None = None,
             cycle1_auditor_run_id: str | None = None,
             provenance_reader: object = None,
-            claim_receipt_path: str | Path | None = None) -> int:
+            claim_receipt_path: str | Path | None = None,
+            worker_manifest_path: str | Path | None = None,
+            worker_manifest: dict[str, object] | None = None) -> int:
     if operation not in _ROLE_TOKEN:
         raise F4RuntimeHold("operation_invalid")
     if not _GIT_SHA.fullmatch(expected_base_sha):
@@ -152,6 +155,25 @@ def execute(*, operation: str, workspace: str | Path, expected_base_sha: str,
         journal = F4CycleControlJournal(
             backend, trusted_signing_keys=owner_keys, trusted_auditor_key=auditor_key,
         )
+        if operation == "verify-worker-receipt":
+            if (claim_receipt_path is None
+                    or (worker_manifest_path is None) == (worker_manifest is None)
+                    or not isinstance(run_id, str) or not re.fullmatch(r"[1-9][0-9]*", run_id)
+                    or not values.get("GITHUB_TOKEN")):
+                raise F4RuntimeHold("worker_receipt_verification_inputs_missing")
+            manifest = worker_manifest if worker_manifest_path is None else _read_json(worker_manifest_path)
+            identity = manifest.get("worker_run_id") if isinstance(manifest, dict) else None
+            if (type(cycle) is not int or cycle not in (1, 2) or not isinstance(identity, str)
+                    or not re.fullmatch(rf"{run_id}-[1-9][0-9]*-cycle-{cycle}", identity)):
+                raise F4RuntimeHold("worker_receipt_run_mismatch")
+            claim = journal.verify_worker_claim(
+                candidate=candidate, go=go, receipt=_read_json(claim_receipt_path),
+                manifest=manifest, expected_cycle=cycle, expected_run_id=identity,
+                expected_execution_sha=source_commit_sha, github_read_token=values["GITHUB_TOKEN"],
+            )
+            if worker_manifest_path is not None:
+                print(f"F4_WORKER_RECEIPT_VERIFIED:{claim.run_id}")
+            return 0
         if operation == "initialize":
             state = journal.initialize(candidate=candidate, go=go, revocation_status=revocation)
         elif operation == "claim-cycle1":
@@ -234,6 +256,7 @@ def main() -> int:
     parser.add_argument("--auditor-artifact")
     parser.add_argument("--cycle1-auditor-run-id")
     parser.add_argument("--claim-receipt")
+    parser.add_argument("--worker-manifest")
     args = parser.parse_args()
     receipt = args.claim_receipt
     if receipt is None and args.operation in {"claim-cycle1", "claim-cycle2"}:
@@ -249,7 +272,7 @@ def main() -> int:
             source_commit_sha=args.source_commit_sha,
             auditor_artifact_path=args.auditor_artifact,
             cycle1_auditor_run_id=args.cycle1_auditor_run_id,
-            claim_receipt_path=receipt,
+            claim_receipt_path=receipt, worker_manifest_path=args.worker_manifest,
         )
     except (F4RuntimeHold, CycleControlHold) as exc:
         print("HOLD:" + str(exc))

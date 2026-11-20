@@ -455,6 +455,33 @@ class PublisherGateCryptoTests(unittest.TestCase):
             issue_from_cli_request("permit_authority", request, context=context)
         self.assertEqual(journal.snapshot().sequence, 0)
 
+    def test_trusted_provider_binds_each_of_four_ephemeral_role_keys(self) -> None:
+        from f4_signing_provider import bind_role_context, ROLE_ENVIRONMENTS
+        role_keys = {key.role: key for key in self.trusted_keys.values()}
+        private_keys = {"permit_authority": self.keys["permit_authority"], "witness": self.keys["witness"]}
+        for role in ("owner_a_delegate", "owner_b_delegate"):
+            private_keys[role] = Ed25519PrivateKey.generate()
+            role_keys[role] = TrustedVerificationKey(role + "-provider-test", role, public_bytes(private_keys[role]))
+        for role, environment in ROLE_ENVIRONMENTS.items():
+            with self.subTest(role=role):
+                template = SigningContext(
+                    role=role, signer=None, trusted_keys=self.trusted_keys,
+                    trusted_owner_keys=self.trusted_keys, journal=self.journal,
+                    verify_candidate_scope=lambda _request: False,
+                    verify_revocation_status=lambda _status, _scope: False,
+                    verify_candidate_evidence=lambda _evidence, _scope: False,
+                )
+                encoded = base64.b64encode(private_keys[role].private_bytes(
+                    serialization.Encoding.DER, serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )).decode("ascii")
+                context = bind_role_context(role=role, environment=environment,
+                    template=template, role_keys=role_keys, encoded_private_key=encoded)
+                self.assertEqual(public_bytes(context.signer), role_keys[role].public_key)
+                self.assertIs(context.verify_candidate_scope, template.verify_candidate_scope)
+                self.assertIs(context.verify_revocation_status, template.verify_revocation_status)
+                self.assertIs(context.journal, template.journal)
+
     def _delegation_case(self):
         """Build an ephemeral, real-Ed25519 test delegation and candidate."""
         verified_bundle = self.verify()

@@ -1,0 +1,168 @@
+# DRAFT_HOLD fragment only. Not an Actions workflow; no trigger or caller.
+# Protected launcher, artifact provenance and live verifier context remain disconnected.
+permissions: {}
+jobs:
+  permit_authority:
+    if: ${{ false }}
+    environment: f4-permit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require protected exact code revision before checkout
+        env:
+          TRUSTED_CODE_SHA: ${{ vars.B09_F4_SIGNER_CODE_SHA }}
+        run: |
+          set -euo pipefail
+          [[ "$TRUSTED_CODE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 78
+      - name: Check out trusted code only, never the candidate revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          ref: ${{ vars.B09_F4_SIGNER_CODE_SHA }}
+          path: trusted
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Install trusted pinned dependency before exposing signer credential
+        run: python -m pip install --disable-pip-version-check -r trusted/ops/command-tower/requirements-publisher.txt
+      - name: Protected role provider (disconnected, always HOLD)
+        if: ${{ false }}
+        env:
+          B09_F4_PERMIT_PRIVATE_KEY_PKCS8_B64: ${{ secrets.B09_F4_PERMIT_PRIVATE_KEY_PKCS8_B64 }}
+        run: |
+          python -I -c 'import sys, runpy; sys.path.insert(0, "trusted/ops/command-tower"); runpy.run_module("f4_signing_provider", run_name="__main__")'
+      - name: Publish signature envelope only after provider succeeds
+        if: ${{ false }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: b09-f4-permit_authority-signature
+          path: ${{ runner.temp }}/f4-signatures/permit_authority.json
+          if-no-files-found: error
+          retention-days: 1
+  witness:
+    if: ${{ false }}
+    environment: f4-witness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require protected exact code revision before checkout
+        env:
+          TRUSTED_CODE_SHA: ${{ vars.B09_F4_SIGNER_CODE_SHA }}
+        run: |
+          set -euo pipefail
+          [[ "$TRUSTED_CODE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 78
+      - name: Check out trusted code only, never the candidate revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          ref: ${{ vars.B09_F4_SIGNER_CODE_SHA }}
+          path: trusted
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Install trusted pinned dependency before exposing signer credential
+        run: python -m pip install --disable-pip-version-check -r trusted/ops/command-tower/requirements-publisher.txt
+      - name: Protected role provider (disconnected, always HOLD)
+        if: ${{ false }}
+        env:
+          B09_F4_WITNESS_PRIVATE_KEY_PKCS8_B64: ${{ secrets.B09_F4_WITNESS_PRIVATE_KEY_PKCS8_B64 }}
+        run: |
+          python -I -c 'import sys, runpy; sys.path.insert(0, "trusted/ops/command-tower"); runpy.run_module("f4_signing_provider", run_name="__main__")'
+      - name: Publish signature envelope only after provider succeeds
+        if: ${{ false }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: b09-f4-witness-signature
+          path: ${{ runner.temp }}/f4-signatures/witness.json
+          if-no-files-found: error
+          retention-days: 1
+  owner_a_delegate:
+    if: ${{ false }}
+    environment: f4-delegate-a
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require protected exact code revision before checkout
+        env:
+          TRUSTED_CODE_SHA: ${{ vars.B09_F4_SIGNER_CODE_SHA }}
+        run: |
+          set -euo pipefail
+          [[ "$TRUSTED_CODE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 78
+      - name: Check out trusted code only, never the candidate revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          ref: ${{ vars.B09_F4_SIGNER_CODE_SHA }}
+          path: trusted
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Install trusted pinned dependency before exposing signer credential
+        run: python -m pip install --disable-pip-version-check -r trusted/ops/command-tower/requirements-publisher.txt
+      - name: Protected role provider (disconnected, always HOLD)
+        if: ${{ false }}
+        env:
+          B09_F4_DELEGATE_A_PRIVATE_KEY_PKCS8_B64: ${{ secrets.B09_F4_DELEGATE_A_PRIVATE_KEY_PKCS8_B64 }}
+        run: |
+          python -I -c 'import sys, runpy; sys.path.insert(0, "trusted/ops/command-tower"); runpy.run_module("f4_signing_provider", run_name="__main__")'
+      - name: Publish signature envelope only after provider succeeds
+        if: ${{ false }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: b09-f4-owner_a_delegate-signature
+          path: ${{ runner.temp }}/f4-signatures/owner_a_delegate.json
+          if-no-files-found: error
+          retention-days: 1
+  owner_b_delegate:
+    if: ${{ false }}
+    environment: f4-delegate-b
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require protected exact code revision before checkout
+        env:
+          TRUSTED_CODE_SHA: ${{ vars.B09_F4_SIGNER_CODE_SHA }}
+        run: |
+          set -euo pipefail
+          [[ "$TRUSTED_CODE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 78
+      - name: Check out trusted code only, never the candidate revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          ref: ${{ vars.B09_F4_SIGNER_CODE_SHA }}
+          path: trusted
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Install trusted pinned dependency before exposing signer credential
+        run: python -m pip install --disable-pip-version-check -r trusted/ops/command-tower/requirements-publisher.txt
+      - name: Protected role provider (disconnected, always HOLD)
+        if: ${{ false }}
+        env:
+          B09_F4_DELEGATE_B_PRIVATE_KEY_PKCS8_B64: ${{ secrets.B09_F4_DELEGATE_B_PRIVATE_KEY_PKCS8_B64 }}
+        run: |
+          python -I -c 'import sys, runpy; sys.path.insert(0, "trusted/ops/command-tower"); runpy.run_module("f4_signing_provider", run_name="__main__")'
+      - name: Publish signature envelope only after provider succeeds
+        if: ${{ false }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: b09-f4-owner_b_delegate-signature
+          path: ${{ runner.temp }}/f4-signatures/owner_b_delegate.json
+          if-no-files-found: error
+          retention-days: 1

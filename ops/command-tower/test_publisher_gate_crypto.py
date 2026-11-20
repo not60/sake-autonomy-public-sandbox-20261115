@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import base64
 from datetime import datetime, timezone
+import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -23,6 +25,9 @@ from f4_limited_delegation import (
     verify_delegation_contract,
 )
 from f4_auditor_artifact import verify_limited_delegation as verify_auditor_delegation
+from f4_signing_cli import (
+    SigningCliHold, SigningContext, issue_from_cli_request, main as signing_cli_main,
+)
 from test_cas_journal import MemoryCasBackend
 
 
@@ -222,6 +227,177 @@ class PublisherGateCryptoTests(unittest.TestCase):
                 not_before="2026-11-19T02:00:00Z", expires_at="2026-11-19T04:00:00Z",
                 revocation_sequence=1, delegates={},
             )
+
+    def test_signing_cli_issues_permit_and_witness_with_role_bound_signers(self) -> None:
+        journal = PermitCasJournal(MemoryCasBackend(), repository_id=REPOSITORY_ID)
+        request = {
+            "permit_id": "cli-fixture-permit",
+            "issuer_id": "permit_authority-key",
+            "repository_id": REPOSITORY_ID,
+            "base_sha": BASE_SHA,
+            "candidate_digest": self.manifest["candidate_digest"],
+            "changed_paths": [PATH],
+            "worker_run_id": WORKER_RUN_ID,
+        }
+        permit_context = SigningContext(
+            role="permit_authority", signer=self.keys["permit_authority"],
+            trusted_keys=self.trusted_keys, journal=journal,
+            verify_candidate_scope=lambda observed: observed == request,
+        )
+        permit_output, permit_errors = io.StringIO(), io.StringIO()
+        self.assertEqual(signing_cli_main(
+            ["--role", "permit_authority"], context=permit_context,
+            stdin=io.StringIO(json.dumps(request)), stdout=permit_output,
+            stderr=permit_errors,
+        ), 0)
+        self.assertEqual(permit_errors.getvalue(), "")
+        permit = json.loads(permit_output.getvalue())
+        self.assertEqual(permit["payload"]["issuer_role"], "permit_authority")
+        self.assertEqual(journal.snapshot().sequence, 1)
+
+        witness_request = {"witness_id": "witness-key", "permit": permit}
+        witness_context = SigningContext(
+            role="witness", signer=self.keys["witness"],
+            trusted_keys=self.trusted_keys, journal=journal,
+            verify_candidate_scope=lambda observed: (
+                observed["repository_id"] == REPOSITORY_ID
+                and observed["candidate_digest"] == request["candidate_digest"]
+                and observed["permit"] == permit
+            ),
+        )
+        witness_output, witness_errors = io.StringIO(), io.StringIO()
+        self.assertEqual(signing_cli_main(
+            ["--role", "witness"], context=witness_context,
+            stdin=io.StringIO(json.dumps(witness_request)), stdout=witness_output,
+            stderr=witness_errors,
+        ), 0)
+        witness = json.loads(witness_output.getvalue())
+        self.assertEqual(witness_errors.getvalue(), "")
+        self.assertEqual(witness["payload"]["issuer_role"], "witness")
+        self.assertNotEqual(permit["key_id"], witness["key_id"])
+        self.assertNotEqual(
+            self.trusted_keys[permit["key_id"]].public_key,
+            self.trusted_keys[witness["key_id"]].public_key,
+        )
+
+    def test_signing_cli_delegate_a_and_b_are_separate_and_consumable(self) -> None:
+        from f4_limited_delegation import (
+            build_delegation_payload, combine_candidate_authorization_fragments,
+            verify_delegation_contract, verify_publisher_candidate_authorization,
+        )
+
+        evidence = self._delegation_case()[2]
+        delegate_keys = {
+            "owner_a_delegate": Ed25519PrivateKey.generate(),
+            "owner_b_delegate": Ed25519PrivateKey.generate(),
+        }
+        delegate_entries = {
+            role: {"key_id": role + "-cli-fixture",
+                   "public_key": base64.b64encode(public_bytes(key)).decode("ascii")}
+            for role, key in delegate_keys.items()
+        }
+        payload = build_delegation_payload(
+            delegation_id="cli-limited-delegation",
+            execution_revision=BASE_SHA,
+            cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
+            allowed_paths=(PATH,), not_before="2026-11-19T02:00:00Z",
+            expires_at="2026-11-19T04:00:00Z", revocation_sequence=1,
+            delegates=delegate_entries,
+        )
+        contract = {
+            "schema": 1, "state": "SIGNED_DELEGATION", "payload": payload,
+            "approvals": {
+                role: sign_envelope(key_id=role + "-key", private_key=self.keys[role], payload=payload)
+                for role in ("owner_a", "owner_b")
+            },
+        }
+        status = {"delegation_id": "cli-limited-delegation", "sequence": 1, "status": "ACTIVE"}
+        verify_revocation = lambda observed, scope: (
+            observed == status and scope["delegation_id"] == status["delegation_id"]
+        )
+        verified = verify_delegation_contract(
+            envelope=contract, trusted_owner_keys=self.trusted_keys,
+            expected_execution_revision=BASE_SHA,
+            expected_cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
+            revocation_status=status, verify_revocation_status=verify_revocation,
+            now=F4_NOW,
+        )
+
+        def verify_evidence(observed, scope):
+            return observed == evidence and scope.digest == verified.digest
+
+        request = {
+            "delegation_envelope": contract,
+            "revocation_status": status,
+            "evidence": evidence,
+        }
+        fragments = []
+        for role in ("owner_a_delegate", "owner_b_delegate"):
+            context = SigningContext(
+                role=role, signer=delegate_keys[role],
+                trusted_owner_keys=self.trusted_keys,
+                expected_execution_revision=BASE_SHA,
+                expected_cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
+                verify_revocation_status=verify_revocation,
+                verify_candidate_evidence=verify_evidence, now=F4_NOW,
+            )
+            fragments.append(issue_from_cli_request(role, request, context=context))
+        authorization = combine_candidate_authorization_fragments(
+            delegation=verified, fragments=fragments,
+        )
+        self.assertEqual(set(authorization["signatures"]), set(delegate_keys))
+        self.assertTrue(verify_publisher_candidate_authorization(
+            delegation_envelope=contract, trusted_owner_keys=self.trusted_keys,
+            expected_execution_revision=BASE_SHA,
+            expected_cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
+            revocation_status=status, verify_revocation_status=verify_revocation,
+            authorization=authorization, evidence=evidence,
+            verify_candidate_evidence=verify_evidence, now=F4_NOW,
+        ))
+
+        tampered = {**request, "evidence": {**evidence, "candidate_digest": "0" * 64}}
+        with self.assertRaisesRegex(SigningCliHold, "delegate_fragment_issue_failed"):
+            issue_from_cli_request("owner_a_delegate", tampered, context=SigningContext(
+                role="owner_a_delegate", signer=delegate_keys["owner_a_delegate"],
+                trusted_owner_keys=self.trusted_keys,
+                expected_execution_revision=BASE_SHA,
+                expected_cycle_tasks=("fixture-f4-task-cycle1", "fixture-f4-task-cycle2"),
+                verify_revocation_status=verify_revocation,
+                verify_candidate_evidence=verify_evidence, now=F4_NOW,
+            ))
+
+    def test_signing_cli_fails_closed_without_role_provider_or_scope(self) -> None:
+        output, errors = io.StringIO(), io.StringIO()
+        self.assertEqual(signing_cli_main(
+            ["--role", "permit_authority"], context=None,
+            stdin=io.StringIO("{}"), stdout=output, stderr=errors,
+        ), 78)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "HOLD:trusted_role_signer_provider_not_configured\n")
+
+        journal = PermitCasJournal(MemoryCasBackend(), repository_id=REPOSITORY_ID)
+        request = {
+            "permit_id": "cli-missing-scope",
+            "issuer_id": "permit_authority-key", "repository_id": REPOSITORY_ID,
+            "base_sha": BASE_SHA, "candidate_digest": self.manifest["candidate_digest"],
+            "changed_paths": [PATH], "worker_run_id": WORKER_RUN_ID,
+        }
+        context = SigningContext(
+            role="permit_authority", signer=self.keys["permit_authority"],
+            trusted_keys=self.trusted_keys, journal=journal,
+        )
+        with self.assertRaisesRegex(SigningCliHold, "signer_role_context_mismatch"):
+            issue_from_cli_request(
+                "permit_authority", request,
+                context=SigningContext(
+                    role="witness", signer=self.keys["permit_authority"],
+                    trusted_keys=self.trusted_keys, journal=journal,
+                    verify_candidate_scope=lambda _observed: True,
+                ),
+            )
+        with self.assertRaisesRegex(SigningCliHold, "candidate_scope_verifier_missing"):
+            issue_from_cli_request("permit_authority", request, context=context)
+        self.assertEqual(journal.snapshot().sequence, 0)
 
     def _delegation_case(self):
         """Build an ephemeral, real-Ed25519 test delegation and candidate."""

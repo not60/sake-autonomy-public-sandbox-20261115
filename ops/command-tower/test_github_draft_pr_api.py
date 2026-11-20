@@ -148,6 +148,50 @@ class GitHubDraftPrApiTests(unittest.TestCase):
         self.assertEqual(len(transport.calls), 2)
         self.assertIn("head_sha=" + HEAD, transport.calls[1][1])
 
+    def test_publication_reader_uses_pinned_bytes_and_independent_audit(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from publisher_gate import PublisherGateHold, publication_reader
+
+        oid = hashlib.sha1(f"blob {len(BODY)}\0".encode() + BODY).hexdigest()
+        commit = {"sha": HEAD, "parents": [{"sha": BASE}], "files": [
+            {"filename": PATH, "sha": oid, "status": "modified"},
+        ]}
+        pr = {"number": 1, "state": "open", "draft": True,
+              "html_url": f"https://github.com/{PUBLIC_REPOSITORY}/pull/1",
+              "head": {"ref": PUBLIC_HEAD_BRANCH, "sha": HEAD, "repo": {"full_name": PUBLIC_REPOSITORY}},
+              "base": {"ref": PUBLIC_BASE_BRANCH, "sha": BASE, "repo": {"id": PUBLIC_REPOSITORY_ID}}}
+        blob = {"type": "file", "sha": oid, "encoding": "base64",
+                "content": base64.b64encode(BODY).decode()}
+        run = {"workflow_runs": [{
+            "id": 42, "html_url": f"https://github.com/{PUBLIC_REPOSITORY}/actions/runs/42",
+            "head_sha": HEAD, "event": "pull_request", "status": "completed", "conclusion": "success",
+        }]}
+        gate = Mock()
+        gate.audit_bundle.return_value = SimpleNamespace(
+            repository_id=PUBLIC_REPOSITORY_ID, base_sha=BASE, worker_run_id="worker-fixture",
+            file_sha256=((PATH, hashlib.sha256(BODY).hexdigest()),), candidate_digest="c" * 64,
+            permit_id="permit-fixture", permit_digest="d" * 64, witness_digest="e" * 64,
+            audit_journal_revision=2, audit_journal_head_sha256="f" * 64,
+        )
+        claim = SimpleNamespace(cycle=2, run_id="worker-fixture", go_sha256="a" * 64)
+        transport = FakeTransport([reply([pr]), reply(commit), reply(blob), reply([pr]), reply(run)])
+        reader = publication_reader(gate=gate, github_api=self.api(transport),
+                                    expected_head_sha=HEAD, bundle={"permit": "trusted-input"})
+        result = reader(claim, {"pr_head_sha": "0" * 40, "permit_id": "untrusted"})
+        self.assertEqual((result["pr_head_sha"], result["permit_id"], result["readonly_ci_run_id"]),
+                         (HEAD, "permit-fixture", "42"))
+        gate.audit_bundle.assert_called_once_with(permit="trusted-input")
+        self.assertIn("?ref=" + HEAD, transport.calls[2][1])
+        self.assertTrue(all(call[0] == "GET" for call in transport.calls))
+
+        gate.audit_bundle.return_value.file_sha256 = ((PATH, "0" * 64),)
+        transport = FakeTransport([reply([pr]), reply(commit), reply(blob)])
+        reader = publication_reader(gate=gate, github_api=self.api(transport),
+                                    expected_head_sha=HEAD, bundle={})
+        with self.assertRaisesRegex(PublisherGateHold, "publication_candidate_bytes_mismatch"):
+            reader(claim, None)
+
     def test_ci_readback_holds_if_pr_base_sha_differs(self):
         pr_value = {
             "number": 1, "state": "open", "draft": True,

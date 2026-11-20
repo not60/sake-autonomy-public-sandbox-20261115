@@ -12,10 +12,13 @@ import binascii
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import io
+import json
 import re
 from typing import Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from zipfile import BadZipFile, ZipFile
 
 from attestations import canonical_json
 from cas_journal import CasBackend, CasConflict, CasHold, CasSnapshot, CasValue
@@ -31,6 +34,7 @@ from trusted_key_registry import SIGNING_ROLES, TrustedVerificationKey
 REPOSITORY_ID = 1458303357
 CONTROL_KEY = "repositories/1458303357/b09-f4-cycle-control-v1.json"
 AUDIT_ARTIFACT_NAME = "b09-f4-cycle1-auditor-evidence"
+CYCLE2_AUDIT_ARTIFACT_NAME = "b09-f4-cycle2-auditor-evidence"
 AUDIT_WORKFLOW_PATH = ".github/workflows/public-runner-draft.yml"
 GITHUB_REPOSITORY = "not60/sake-autonomy-public-sandbox-20261115"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -597,8 +601,9 @@ class GitHubArtifactProvenanceReader:
                 or not isinstance(artifacts, Mapping)
                 or not isinstance(artifacts.get("artifacts"), list)):
             raise CycleControlHold("github_artifact_workflow_run_mismatch")
+        name = CYCLE2_AUDIT_ARTIFACT_NAME if payload.get("cycle_number") == 2 else AUDIT_ARTIFACT_NAME
         matches = [item for item in artifacts["artifacts"]
-                   if isinstance(item, Mapping) and item.get("name") == AUDIT_ARTIFACT_NAME]
+                   if isinstance(item, Mapping) and item.get("name") == name]
         if len(matches) != 1:
             raise CycleControlHold("github_artifact_missing_or_duplicated")
         artifact = matches[0]
@@ -616,11 +621,42 @@ class GitHubArtifactProvenanceReader:
             "run_attempt": payload["run_attempt"],
             "workflow_path": AUDIT_WORKFLOW_PATH,
             "source_commit_sha": payload["source_commit_sha"],
-            "artifact_name": AUDIT_ARTIFACT_NAME,
+            "artifact_name": name,
             "artifact_id": artifact["id"],
             "archive_digest": artifact["digest"],
             "expired": artifact["expired"],
         }
+
+    def read_cycle2_archive(self, archive: bytes, *, run_id: str, attempt: int,
+                            execution_sha: str):
+        """Bind an existing Actions ZIP to the exact completed run and signed envelope."""
+        if self._allow_in_progress or not isinstance(archive, bytes) or len(archive) > 2 * 1024 * 1024:
+            raise CycleControlHold("cycle2_archive_input_invalid")
+        try:
+            with ZipFile(io.BytesIO(archive)) as bundle:
+                entries = bundle.infolist()
+                if (len(entries) != 1 or entries[0].filename != "auditor-envelope.json"
+                        or entries[0].file_size > 2 * 1024 * 1024):
+                    raise ValueError
+                envelope = json.loads(bundle.read(entries[0]))
+            payload = envelope["payload"]
+            _validate_audit_payload(payload, cycle=2)
+            if (payload["workflow_run_id"] != run_id or payload["run_attempt"] != attempt
+                    or payload["source_commit_sha"] != execution_sha):
+                raise ValueError
+        except (BadZipFile, KeyError, ValueError, TypeError, RuntimeError, OSError):
+            raise CycleControlHold("cycle2_archive_envelope_invalid") from None
+        proof = self(payload)
+        if proof["archive_digest"] != "sha256:" + _sha256(archive):
+            raise CycleControlHold("cycle2_archive_digest_mismatch")
+        pinned_payload = canonical_json(payload)
+
+        def verify(value):
+            if canonical_json(value) != pinned_payload:
+                raise CycleControlHold("cycle2_archive_payload_mismatch")
+            return dict(proof)
+
+        return envelope, verify
 
     def _get_json(self, path: str) -> object:
         request = Request(
@@ -710,7 +746,7 @@ def _verify_auditor_artifact(artifact: object, *, go: VerifiedF4Go, go_sha256: s
             or provenance.get("run_attempt") != payload["run_attempt"]
             or provenance.get("workflow_path") != AUDIT_WORKFLOW_PATH
             or provenance.get("source_commit_sha") != payload["source_commit_sha"]
-            or provenance.get("artifact_name") != AUDIT_ARTIFACT_NAME
+            or provenance.get("artifact_name") != (CYCLE2_AUDIT_ARTIFACT_NAME if cycle == 2 else AUDIT_ARTIFACT_NAME)
             or isinstance(provenance.get("artifact_id"), bool)
             or not isinstance(provenance.get("artifact_id"), int)
             or provenance.get("artifact_id") <= 0

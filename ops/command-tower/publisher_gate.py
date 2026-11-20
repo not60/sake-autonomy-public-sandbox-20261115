@@ -55,6 +55,8 @@ class OfflineVerificationResult:
     draft_pr_ready: bool = False
     publication_authorized: bool = False
     _gate_seal: object | None = field(default=None, repr=False, compare=False)
+    audit_journal_revision: int | None = None
+    audit_journal_head_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -346,6 +348,8 @@ class PublisherGate:
             worker_run_id=worker_run_id, codex_output_sha256=output_digest,
             witness_digest=witness_digest, draft_pr_ready=consume,
             publication_authorized=False, _gate_seal=_GATE_SEAL if consume else None,
+            audit_journal_revision=None if consume else snapshot.sequence,
+            audit_journal_head_sha256=None if consume else snapshot.head_sha256,
         )
 
     @staticmethod
@@ -496,6 +500,51 @@ def _canonical(value: object) -> bytes:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def read_verified_publication(*, gate: PublisherGate, github_api, expected_head_sha: str,
+                              bundle: Mapping[str, object]) -> dict[str, object]:
+    """Independently read the signed inputs, Permit journal, pinned PR bytes and CI."""
+    result = gate.audit_bundle(**bundle)
+    if (result.repository_id != PUBLIC_REPOSITORY_ID
+            or result.audit_journal_revision is None or result.audit_journal_head_sha256 is None):
+        raise PublisherGateHold("publication_audit_snapshot_missing")
+    pr = github_api.get_open_draft_pull_request(
+        PUBLIC_REPOSITORY_ID, PUBLIC_HEAD_BRANCH, PUBLIC_BASE_BRANCH,
+    )
+    if (pr.number != 1 or pr.head_sha != expected_head_sha
+            or pr.base_sha != result.base_sha or pr.draft is not True):
+        raise PublisherGateHold("publication_pr_scope_mismatch")
+    if github_api.read_commit_file_digests(pr.head_sha) != dict(result.file_sha256):
+        raise PublisherGateHold("publication_candidate_bytes_mismatch")
+    ci = github_api.read_readonly_ci_run(pr.number, pr.head_sha, pr.base_sha)
+    if ci.status != "completed" or ci.conclusion != "success":
+        raise PublisherGateHold("publication_ci_not_success")
+    return {
+        "worker_run_id": result.worker_run_id, "pr_number": pr.number,
+        "pr_head_sha": pr.head_sha, "pr_base_sha": pr.base_sha, "pr_state": "open",
+        "pr_is_draft": pr.draft, "pr_merged": False, "readonly_ci_run_id": str(ci.run_id),
+        "readonly_ci_conclusion": ci.conclusion, "candidate_digest": result.candidate_digest,
+        "permit_id": result.permit_id, "permit_sha256": result.permit_digest,
+        "witness_digest": result.witness_digest,
+        "journal_revision": result.audit_journal_revision,
+        "journal_head_sha256": result.audit_journal_head_sha256,
+    }
+
+
+def publication_reader(*, gate: PublisherGate, github_api, expected_head_sha: str,
+                       bundle: Mapping[str, object]):
+    """Build the protected stage adapter without taking lookup inputs from the envelope."""
+    def read(claim, _signed_payload):
+        verified = read_verified_publication(
+            gate=gate, github_api=github_api, expected_head_sha=expected_head_sha, bundle=bundle,
+        )
+        if verified["worker_run_id"] != claim.run_id:
+            raise PublisherGateHold("publication_worker_run_mismatch")
+        if claim.cycle == 1:
+            del verified["permit_sha256"]
+        return {**verified, "go_sha256": claim.go_sha256}
+    return read
 
 
 def _write_f4_audit_evidence(path: str | Path, evidence: Mapping[str, object]) -> None:

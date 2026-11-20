@@ -569,6 +569,41 @@ class GitHubDraftPrApi:
             file_digests[path] = hashlib.sha256(raw).hexdigest()
         return BranchSnapshot(branch, head_sha, base_sha, file_digests)
 
+    def read_commit_file_digests(self, sha: str) -> dict[str, str]:
+        """Read the publication commit delta and candidate bytes at an immutable SHA."""
+        _required_git_sha(sha, "publication_commit_sha_invalid")
+        commit = self._request("GET", f"/repos/{PUBLIC_REPOSITORY}/commits/{sha}?per_page=100")
+        if not isinstance(commit, dict) or commit.get("sha") != sha:
+            raise GitHubApiHold("publication_commit_identity_invalid")
+        files, parents = commit.get("files"), commit.get("parents")
+        if (not isinstance(files, list) or not 0 < len(files) < 100
+                or not isinstance(parents, list) or len(parents) != 1):
+            raise GitHubApiHold("publication_commit_delta_invalid")
+        digests: dict[str, str] = {}
+        for entry in files:
+            if not isinstance(entry, dict):
+                raise GitHubApiHold("publication_file_invalid")
+            path = entry.get("filename")
+            if (not isinstance(path, str) or path not in ALLOWED_CHANGED_PATHS
+                    or path in digests or entry.get("status") not in {"added", "modified"}):
+                raise GitHubApiHold("publication_path_outside_scope")
+            oid = _required_git_sha(entry.get("sha"), "publication_blob_invalid")
+            contents = self._request(
+                "GET", f"/repos/{PUBLIC_REPOSITORY}/contents/{quote(path, safe='/')}?ref={sha}",
+            )
+            if (not isinstance(contents, dict) or contents.get("type") != "file"
+                    or contents.get("sha") != oid or contents.get("encoding") != "base64"
+                    or not isinstance(contents.get("content"), str)):
+                raise GitHubApiHold("publication_blob_read_mismatch")
+            try:
+                raw = base64.b64decode("".join(contents["content"].split()), validate=True)
+            except ValueError:
+                raise GitHubApiHold("publication_blob_encoding_invalid") from None
+            if hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() != oid:
+                raise GitHubApiHold("publication_blob_digest_mismatch")
+            digests[path] = hashlib.sha256(raw).hexdigest()
+        return digests
+
     def find_open_pull_request(self, repository_id: int, head: str, base: str) -> bool:
         return self._matching_open_pull_request(repository_id, head, base) is not None
 

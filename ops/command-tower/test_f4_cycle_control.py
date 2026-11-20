@@ -179,7 +179,8 @@ class F4CycleControlTests(unittest.TestCase):
             "run_attempt": payload["run_attempt"],
             "workflow_path": payload["workflow_path"],
             "source_commit_sha": payload["source_commit_sha"],
-            "artifact_name": AUDIT_ARTIFACT_NAME,
+            "artifact_name": (f4_cycle_control.CYCLE2_AUDIT_ARTIFACT_NAME
+                              if payload.get("cycle_number") == 2 else AUDIT_ARTIFACT_NAME),
             "artifact_id": 9001,
             "archive_digest": "sha256:" + "f" * 64,
             "expired": False,
@@ -224,7 +225,10 @@ class F4CycleControlTests(unittest.TestCase):
     def _finite_fixture(self, *, stop_ok=True, audit_ok=True, bad_claim=False, replay_audit=False, final_stop_missing=False):
         import f4_limited_delegation as delegation
         from attestations import sign_envelope
-        from f4_auditor_artifact import sign_cycle2_audit
+        import base64
+        import io
+        from zipfile import ZipFile
+        from f4_auditor_artifact import create_cycle2_artifact, verify_cycle2_archive
         observer = TrustedVerificationKey("stop-fixture", "stop_observer",
                                           self.keys.public_keys["permit_authority"])
         scope = {"executor": "fixture", "process_namespace": "fixture-processes",
@@ -250,12 +254,7 @@ class F4CycleControlTests(unittest.TestCase):
                 return artifact
             if replay_audit:
                 return artifact
-            return sign_cycle2_audit(key_id=self.auditor_key.key_id, private_key=signer,
-                payload={**payload, "schema": 2, "cycle_number": 2,
-                         "worker_run_id": "12346-2-cycle-2", "workflow_run_id": "102",
-                         "auditor_run_id": "102:1:auditor", "permit_id": "permit-cycle2",
-                         "readonly_ci_run_id": "ci-102", "permit_sha256": "a" * 64,
-                         "cycle1_audit_sha256": hashlib.sha256(canonical_json(artifact)).hexdigest()})
+            return "cycle2-publication-ready"
         def verify(cycle, run_id):
             if bad_claim:
                 return True
@@ -265,7 +264,51 @@ class F4CycleControlTests(unittest.TestCase):
                       "pr_state", "pr_is_draft", "pr_merged", "readonly_ci_run_id", "readonly_ci_conclusion",
                       "permit_id", "candidate_digest", "witness_digest", "journal_revision", "journal_head_sha256",
                       "permit_sha256")
-            # Fixed fixture values from the independently prepared stage envelope.
+            if claim.cycle == 2 and not replay_audit:
+                publication = {key: payload[key] for key in fields if key in payload}
+                publication.update(go_sha256=claim.go_sha256, worker_run_id=claim.run_id,
+                                   permit_id="permit-cycle2", readonly_ci_run_id="ci-102",
+                                   permit_sha256="a" * 64)
+                read_publication = lambda *_: publication
+                target = self.root / "auditor-envelope.json"
+                with patch("f4_auditor_artifact._SignerProxy", return_value=signer):
+                    create_cycle2_artifact(
+                        claim=claim, previous=previous, publication_reader=read_publication,
+                        output=target, candidate=self.candidate, workspace=self.root,
+                        expected_base_sha=BASE_SHA, trusted_keys={"keys": [
+                            {"key_id": key.key_id, "role": key.role,
+                             "public_key": base64.b64encode(key.public_key).decode()}
+                            for key in self.owner_keys.values()
+                        ]}, auditor_key_document={
+                            "key_id": self.auditor_key.key_id, "role": "auditor",
+                            "public_key": base64.b64encode(self.auditor_key.public_key).decode(),
+                        }, revocation_envelope=self.revocation, workflow_run_id="102",
+                        run_attempt=1, source_commit_sha=claim.source_commit_sha, now=NOW,
+                    )
+                stream = io.BytesIO()
+                with ZipFile(stream, "w") as bundle:
+                    bundle.write(target, "auditor-envelope.json")
+                archive = stream.getvalue()
+                reader = GitHubArtifactProvenanceReader(bearer_token="test-only")
+                def get_json(path):
+                    if path.endswith("/artifacts"):
+                        return {"artifacts": [{
+                            "id": 9002, "name": f4_cycle_control.CYCLE2_AUDIT_ARTIFACT_NAME,
+                            "expired": False, "workflow_run": {"id": 102},
+                            "digest": "sha256:" + hashlib.sha256(archive).hexdigest(),
+                        }]}
+                    return {"id": 102, "run_attempt": 1, "path": AUDIT_WORKFLOW_PATH,
+                            "head_sha": claim.source_commit_sha, "status": "completed",
+                            "conclusion": "success", "repository": {"id": 1458303357}}
+                with patch.object(reader, "_get_json", side_effect=get_json):
+                    with self.assertRaisesRegex(CycleControlHold, "cycle2_archive_digest_mismatch"):
+                        reader.read_cycle2_archive(archive + b"!", run_id="102", attempt=1,
+                                                   execution_sha=claim.source_commit_sha)
+                    return verify_cycle2_archive(
+                        journal=self.control, reader=reader, archive=archive, run_id="102", attempt=1,
+                        candidate=self.candidate, go=self.go, claim=claim, previous=previous,
+                        publication_reader=read_publication, now=NOW,
+                    )
             readback = {key: envelope["payload"][key] for key in fields if key in envelope["payload"]}
             return self.control.verify_stage_audit(candidate=self.candidate, go=self.go,
                 claim=claim, artifact=envelope, previous=previous, verify_github_artifact=self._provenance,

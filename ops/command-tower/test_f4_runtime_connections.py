@@ -212,7 +212,7 @@ class F4RuntimeConnectionTests(unittest.TestCase):
                 "B09_F4_CONTROL_V2_WORKER_BEARER": "w" * 40,
                 "GITHUB_TOKEN": "g" * 40,
             }
-            fake_state = type("State", (), {"sequence": 4})()
+            fake_state = type("State", (), {"sequence": 4, "go_sha256": "a" * 64, "head_sha256": "b" * 64, "version": "4"})()
             with patch("f4_cycle_runtime.verify_f4_go_candidate", return_value=object()), \
                  patch("f4_cycle_runtime.HttpsCasBackend") as backend, \
                  patch("f4_cycle_runtime.F4CycleControlJournal") as journal_class:
@@ -225,9 +225,10 @@ class F4RuntimeConnectionTests(unittest.TestCase):
                         operation="claim-cycle2", workspace=ROOT, expected_base_sha=BASE,
                         candidate_path=folder / "candidate.json", revocation_path=folder / "revocation.json",
                         trusted_keys_path=folder / "trusted.json", auditor_key_path=folder / "auditor.json",
-                        env=env, cycle=2, run_id="100-1", source_commit_sha="b" * 40,
+                        env=env, cycle=2, run_id="100-1-cycle-2", source_commit_sha="b" * 40,
                         auditor_artifact_path=folder / "auditor-envelope.json",
                         cycle1_auditor_run_id="99", provenance_reader=reader,
+                        claim_receipt_path=folder / "receipt.json",
                     )
                 self.assertEqual(result, 0)
                 backend.assert_called_once_with(endpoint=f4_cycle_runtime.CAS_ENDPOINT, bearer_token="w" * 40)
@@ -235,15 +236,21 @@ class F4RuntimeConnectionTests(unittest.TestCase):
                 self.assertIs(journal.claim_cycle.call_args.kwargs["verify_github_artifact"], reader)
                 self.assertIn("F4_CYCLE_CONTROL_OK:claim-cycle2:4", out.getvalue())
 
+                self.assertEqual(json.loads((folder / "receipt.json").read_text()), {
+                    "repository_id": 1458303357, "cycle": 2, "run_id": "100-1-cycle-2",
+                    "source_commit_sha": "b" * 40, "go_sha256": "a" * 64,
+                    "journal_sequence": 4, "journal_head_sha256": "b" * 64, "journal_version": "4",
+                })
                 journal.claim_cycle.reset_mock()
                 with self.assertRaisesRegex(f4_cycle_runtime.F4RuntimeHold, "cycle1_auditor_run_id_mismatch"):
                     f4_cycle_runtime.execute(
                         operation="claim-cycle2", workspace=ROOT, expected_base_sha=BASE,
                         candidate_path=folder / "candidate.json", revocation_path=folder / "revocation.json",
                         trusted_keys_path=folder / "trusted.json", auditor_key_path=folder / "auditor.json",
-                        env=env, cycle=2, run_id="101-1", source_commit_sha="c" * 40,
+                        env=env, cycle=2, run_id="101-1-cycle-2", source_commit_sha="c" * 40,
                         auditor_artifact_path=folder / "auditor-envelope.json",
                         cycle1_auditor_run_id="100", provenance_reader=reader,
+                        claim_receipt_path=folder / "unused-receipt.json",
                     )
                 journal.claim_cycle.assert_not_called()
 
@@ -253,7 +260,7 @@ class F4RuntimeConnectionTests(unittest.TestCase):
                     candidate_path=folder / "candidate.json", revocation_path=folder / "revocation.json",
                     trusted_keys_path=folder / "trusted.json", auditor_key_path=folder / "auditor.json",
                     env={"B09_CAS_ENDPOINT": f4_cycle_runtime.CAS_ENDPOINT},
-                    cycle=1, run_id="100-1", source_commit_sha="b" * 40,
+                    cycle=1, run_id="100-1-cycle-2", source_commit_sha="b" * 40,
                 )
 
     def test_workflow_trust_roots_are_external_and_all_execution_stays_disabled(self):

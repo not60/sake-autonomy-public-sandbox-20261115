@@ -12,6 +12,7 @@ from pathlib import Path
 from f4_cycle_control import (
     AUDIT_WORKFLOW_PATH, CycleControlHold, _validate_audit_payload,
     _verify_revocation_status, build_cycle1_auditor_artifact,
+    is_verified_stage_audit, is_verified_worker_claim,
 )
 from f4_go_gate import F4GoHold, verify_f4_go_candidate, verified_f4_go_sha256
 from trusted_key_registry import TrustedVerificationKey, load_trusted_verification_keys
@@ -49,7 +50,8 @@ def build_payload(*, evidence: object, candidate: object, workspace: str | Path,
                   expected_base_sha: str, trusted_keys: object,
                   auditor_key_document: object, revocation_envelope: object,
                   workflow_run_id: str, run_attempt: int, source_commit_sha: str,
-                  now: datetime | None = None) -> tuple[dict[str, object], str]:
+                  now: datetime | None = None,
+                  cycle1_audit_sha256: str | None = None) -> tuple[dict[str, object], str]:
     owner_keys = load_trusted_verification_keys(trusted_keys)
     if (not isinstance(auditor_key_document, dict)
             or set(auditor_key_document) != {"key_id", "role", "public_key"}
@@ -95,12 +97,16 @@ def build_payload(*, evidence: object, candidate: object, workspace: str | Path,
     except (TypeError, ValueError) as exc:
         raise ValueError("signed_go_or_revocation_invalid:" + type(exc).__name__) from None
 
-    if not isinstance(evidence, dict) or set(evidence) != {
+    fields = {
         "schema", "repository_id", "base_sha", "worker_run_id", "candidate_digest",
         "permit_id", "witness_digest", "journal_revision", "journal_head_sha256",
         "pr_number", "pr_state", "pr_is_draft", "pr_merged", "pr_head_sha",
         "pr_base_sha", "readonly_ci_run_id", "readonly_ci_conclusion",
-    }:
+    }
+    cycle = 1 if cycle1_audit_sha256 is None else 2
+    if cycle == 2:
+        fields.add("permit_sha256")
+    if not isinstance(evidence, dict) or set(evidence) != fields:
         raise ValueError("auditor_evidence_fields_invalid")
     expiry = min(instant + timedelta(minutes=10), go.expires_at)
     if expiry <= instant:
@@ -119,8 +125,8 @@ def build_payload(*, evidence: object, candidate: object, workspace: str | Path,
         raise ValueError("auditor_evidence_scope_mismatch")
 
     payload = {
-        "schema": 1, "kind": "F4_CYCLE_AUDIT", "repository_id": 1458303357,
-        "approval_id": go.approval_id, "go_sha256": go_sha, "cycle_number": 1,
+        "schema": cycle, "kind": "F4_CYCLE_AUDIT", "repository_id": 1458303357,
+        "approval_id": go.approval_id, "go_sha256": go_sha, "cycle_number": cycle,
         "worker_run_id": evidence["worker_run_id"],
         "auditor_run_id": f"{workflow_run_id}:{run_attempt}:auditor",
         "workflow_run_id": workflow_run_id, "run_attempt": run_attempt,
@@ -138,8 +144,11 @@ def build_payload(*, evidence: object, candidate: object, workspace: str | Path,
         "result": "PASS", "issued_at": instant.isoformat(timespec="seconds").replace("+00:00", "Z"),
         "expires_at": expiry.isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
+    if cycle == 2:
+        payload.update(cycle1_audit_sha256=cycle1_audit_sha256,
+                       permit_sha256=evidence["permit_sha256"])
     try:
-        _validate_audit_payload(payload)
+        _validate_audit_payload(payload, cycle)
     except CycleControlHold:
         raise ValueError("auditor_payload_contract_invalid") from None
     return payload, go_sha
@@ -197,6 +206,11 @@ def create_artifact(*, evidence: object, candidate: object, workspace: str | Pat
     envelope = build_cycle1_auditor_artifact(
         payload=payload, key_id=auditor_document["key_id"], private_key=signer,
     )
+    _write_envelope(output, envelope)
+    return go_sha
+
+
+def _write_envelope(output, envelope):
     target = Path(output)
     target.parent.mkdir(parents=True, exist_ok=True)
     data = (json.dumps(envelope, sort_keys=True, indent=2) + "\n").encode("utf-8")
@@ -205,7 +219,6 @@ def create_artifact(*, evidence: object, candidate: object, workspace: str | Pat
         stream.write(data)
         stream.flush()
         os.fsync(stream.fileno())
-    return go_sha
 
 
 def main() -> int:
@@ -232,6 +245,54 @@ def main() -> int:
     print("F4_AUDITOR_ARTIFACT_READY:" + go_sha)
     return 0
 
+
+
+def create_cycle2_artifact(*, claim, previous, publication_reader, output,
+                           candidate, workspace, expected_base_sha, trusted_keys,
+                           auditor_key_document, revocation_envelope,
+                           workflow_run_id, run_attempt, source_commit_sha, now=None):
+    """Sign and save Cycle2 using the independently read publication and Cycle1 audit."""
+    if (not is_verified_worker_claim(claim) or claim.cycle != 2
+            or previous is None or not is_verified_stage_audit(previous, previous.claim, None)
+            or previous.claim.cycle != 1 or previous.claim.go_sha256 != claim.go_sha256
+            or claim.source_commit_sha != source_commit_sha):
+        raise ValueError("cycle2_signing_context_invalid")
+    publication = dict(publication_reader(claim, None))
+    if (publication.pop("go_sha256", None) != claim.go_sha256
+            or publication.get("worker_run_id") != claim.run_id
+            or str(workflow_run_id) in {previous.workflow_run_id, claim.run_id.split("-")[0]}
+            or publication.get("permit_id") == previous.permit_id
+            or publication.get("readonly_ci_run_id") == previous.ci_run_id):
+        raise ValueError("cycle2_publication_scope_mismatch")
+    payload, go_sha = build_payload(
+        evidence={**publication, "schema": 1, "repository_id": 1458303357,
+                  "base_sha": expected_base_sha},
+        candidate=candidate, workspace=workspace, expected_base_sha=expected_base_sha,
+        trusted_keys=trusted_keys, auditor_key_document=auditor_key_document,
+        revocation_envelope=revocation_envelope, workflow_run_id=workflow_run_id,
+        run_attempt=run_attempt, source_commit_sha=source_commit_sha,
+        cycle1_audit_sha256=previous.envelope_sha256, now=now,
+    )
+    if go_sha != claim.go_sha256:
+        raise ValueError("cycle2_signed_go_mismatch")
+    owner_keys = load_trusted_verification_keys(trusted_keys)
+    key = TrustedVerificationKey(auditor_key_document["key_id"], "auditor",
+                                 base64.b64decode(auditor_key_document["public_key"], validate=True))
+    signer = _SignerProxy(key, owner_keys)
+    _write_envelope(output, sign_cycle2_audit(payload=payload, key_id=key.key_id, private_key=signer))
+    return go_sha
+
+
+def verify_cycle2_archive(*, journal, reader, archive, run_id, attempt,
+                          candidate, go, claim, previous, publication_reader, now=None):
+    envelope, verify_provenance = reader.read_cycle2_archive(
+        archive, run_id=run_id, attempt=attempt, execution_sha=claim.source_commit_sha,
+    )
+    return journal.verify_stage_audit(
+        candidate=candidate, go=go, claim=claim, artifact=envelope, previous=previous,
+        verify_github_artifact=verify_provenance, read_verified_publication=publication_reader,
+        now=now,
+    )
 
 
 def sign_cycle2_audit(*, payload, key_id, private_key):

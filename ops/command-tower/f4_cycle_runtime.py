@@ -99,7 +99,8 @@ def execute(*, operation: str, workspace: str | Path, expected_base_sha: str,
             run_id: str | None = None, source_commit_sha: str | None = None,
             auditor_artifact_path: str | Path | None = None,
             cycle1_auditor_run_id: str | None = None,
-            provenance_reader: object = None) -> int:
+            provenance_reader: object = None,
+            claim_receipt_path: str | Path | None = None) -> int:
     if operation not in _ROLE_TOKEN:
         raise F4RuntimeHold("operation_invalid")
     if not _GIT_SHA.fullmatch(expected_base_sha):
@@ -133,6 +134,18 @@ def execute(*, operation: str, workspace: str | Path, expected_base_sha: str,
         )
     except (F4GoHold, TypeError, ValueError):
         raise F4RuntimeHold("signed_f4_go_or_source_binding_invalid") from None
+
+    claim_operation = operation in {"claim-cycle1", "claim-cycle2"}
+    if claim_operation:
+        if (type(cycle) is not int or cycle != int(operation[-1])
+                or not isinstance(run_id, str)
+                or not re.fullmatch(rf"[1-9][0-9]*-[1-9][0-9]*-cycle-{cycle}", run_id)
+                or claim_receipt_path is None):
+            raise F4RuntimeHold("claim_receipt_inputs_invalid")
+        receipt_target = Path(claim_receipt_path)
+        if (not receipt_target.parent.is_dir() or receipt_target.exists()
+                or receipt_target.is_symlink()):
+            raise F4RuntimeHold("claim_receipt_output_unavailable")
 
     try:
         backend = HttpsCasBackend(endpoint=endpoint, bearer_token=bearer)
@@ -179,6 +192,22 @@ def execute(*, operation: str, workspace: str | Path, expected_base_sha: str,
     except Exception:
         # HttpsCasBackend is single-shot; unknown outcomes are surfaced as HOLD, never retried.
         raise F4RuntimeHold("cycle_control_operation_failed_no_retry") from None
+    if claim_operation:
+        receipt = {
+            "repository_id": REPOSITORY_ID, "cycle": cycle, "run_id": run_id,
+            "source_commit_sha": source_commit_sha, "go_sha256": state.go_sha256,
+            "journal_sequence": state.sequence, "journal_head_sha256": state.head_sha256,
+            "journal_version": state.version,
+        }
+        try:
+            fd = os.open(receipt_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(receipt, stream, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError:
+            raise F4RuntimeHold("claim_committed_receipt_save_failed_no_retry") from None
     print(f"F4_CYCLE_CONTROL_OK:{operation}:{state.sequence}")
     return 0
 
@@ -204,7 +233,13 @@ def main() -> int:
     parser.add_argument("--source-commit-sha")
     parser.add_argument("--auditor-artifact")
     parser.add_argument("--cycle1-auditor-run-id")
+    parser.add_argument("--claim-receipt")
     args = parser.parse_args()
+    receipt = args.claim_receipt
+    if receipt is None and args.operation in {"claim-cycle1", "claim-cycle2"}:
+        runner_temp = os.environ.get("RUNNER_TEMP")
+        if runner_temp and Path(runner_temp).is_absolute():
+            receipt = Path(runner_temp) / "f4-worker-claim-receipt.json"
     try:
         return execute(
             operation=args.operation, workspace=args.workspace,
@@ -214,8 +249,9 @@ def main() -> int:
             source_commit_sha=args.source_commit_sha,
             auditor_artifact_path=args.auditor_artifact,
             cycle1_auditor_run_id=args.cycle1_auditor_run_id,
+            claim_receipt_path=receipt,
         )
-    except F4RuntimeHold as exc:
+    except (F4RuntimeHold, CycleControlHold) as exc:
         print("HOLD:" + str(exc))
         return 78
 

@@ -148,6 +148,70 @@ def verify_safe_stop(*, envelope, audit, observer_key, expected_scope, now=None)
     return VerifiedSafeStop(audit, _EVIDENCE_SEAL)
 
 
+def build_cycle_safe_stop_verifier(*, observer_key, expected_scope,
+                                  trusted_signing_keys, read_signed_observation, now=None):
+    """Connect a protected, independent observation reader to finite-cycle control.
+
+    The reader must obtain the signed envelope from the trusted stop-observer
+    source. This adapter never invents an observation and consumes each cycle's
+    read attempt once; missing, ambiguous, or invalid evidence fails closed.
+    """
+    if not callable(read_signed_observation):
+        raise CycleControlHold("safe_stop_observation_reader_missing")
+    if (not isinstance(observer_key, TrustedVerificationKey)
+            or observer_key.role != "stop_observer"
+            or len(observer_key.public_key) != 32):
+        raise CycleControlHold("stop_observer_or_scope_missing")
+    if (not isinstance(trusted_signing_keys, Mapping)
+            or {key.role for key in trusted_signing_keys.values()
+                if isinstance(key, TrustedVerificationKey)} != set(SIGNING_ROLES)
+            or any(not isinstance(key, TrustedVerificationKey)
+                   for key in trusted_signing_keys.values())
+            or observer_key.key_id in trusted_signing_keys
+            or observer_key.public_key in {key.public_key for key in trusted_signing_keys.values()}):
+        raise CycleControlHold("stop_observer_key_not_independent")
+    if (not isinstance(expected_scope, Mapping)
+            or set(expected_scope) != {"executor", "process_namespace", "continuation_namespace"}
+            or any(not isinstance(value, str) or not value.strip()
+                   for value in expected_scope.values())):
+        raise CycleControlHold("stop_observer_or_scope_missing")
+
+    attempted_cycles: set[int] = set()
+    previous_audit: VerifiedStageAudit | None = None
+
+    def verify(cycle, stage_receipt, audit):
+        nonlocal previous_audit
+        if (type(cycle) is not int or cycle not in (1, 2)
+                or cycle != len(attempted_cycles) + 1 or cycle in attempted_cycles
+                or stage_receipt is None
+                or not isinstance(audit, VerifiedStageAudit)
+                or not is_verified_worker_claim(audit.claim)
+                or audit.claim.cycle != cycle
+                or not is_verified_stage_audit(audit, audit.claim, previous_audit)):
+            raise CycleControlHold("safe_stop_audit_or_cycle_binding_invalid")
+
+        # A reader timeout or malformed response is not retried by this adapter.
+        attempted_cycles.add(cycle)
+        try:
+            envelope = read_signed_observation(
+                cycle=cycle, stage_receipt=stage_receipt, audit=audit,
+            )
+        except Exception:
+            raise CycleControlHold("safe_stop_observation_unavailable_no_retry") from None
+        if envelope is None:
+            raise CycleControlHold("safe_stop_observation_missing")
+        verified = verify_safe_stop(
+            envelope=envelope, audit=audit, observer_key=observer_key,
+            expected_scope=expected_scope, now=now,
+        )
+        if not is_verified_safe_stop(verified, audit):
+            raise CycleControlHold("safe_stop_observation_unverified")
+        previous_audit = audit
+        return verified
+
+    return verify
+
+
 def is_verified_stage_audit(value, claim, previous):
     return (isinstance(value, VerifiedStageAudit) and value._seal is _EVIDENCE_SEAL
             and value.claim == claim and value.previous_sha256 == (

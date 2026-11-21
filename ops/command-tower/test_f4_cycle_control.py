@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import f4_cycle_control
-from attestations import canonical_json
+from attestations import canonical_json, sign_envelope
 from cas_journal import CasConflict, CasValue
 from f4_cycle_control import (
     AUDIT_ARTIFACT_NAME,
@@ -380,6 +380,178 @@ class F4CycleControlTests(unittest.TestCase):
         delegation, kwargs, calls, stopped = self._finite_fixture(final_stop_missing=True)
         with self.assertRaisesRegex(delegation.DelegationHold, "cycle_safe_stop_unverified"):
             delegation.execute_finite_two_cycles(**kwargs)
+        self.assertEqual(calls[-1], (2, "publish-audit"))
+        self.assertEqual(stopped, ["stop"])
+
+    def test_protected_stop_reader_connects_signed_observations_to_both_cycles(self):
+        import f4_limited_delegation as delegation
+
+        delegation, kwargs, calls, stopped = self._finite_fixture()
+        observer_root = self.root / "stop-observer-test-keys"
+        observer_root.mkdir()
+        observer_signer = EphemeralEd25519(observer_root)
+        observer = TrustedVerificationKey(
+            "stop-observer-fixture", "stop_observer", observer_signer.public_keys["witness"],
+        )
+        scope = {"executor": "isolated-fixture", "process_namespace": "fixture-processes",
+                 "continuation_namespace": "fixture-queue"}
+        signer = type("ObserverSigner", (), {
+            "sign": lambda _self, message: observer_signer.sign("witness", message),
+        })()
+        observed_cycles = []
+
+        def read_signed_observation(*, cycle, stage_receipt, audit):
+            observed_cycles.append(cycle)
+            payload = {
+                "schema": 1, "kind": "F4_SAFE_STOP", "repository_id": 1458303357,
+                "cycle": cycle, "worker_run_id": audit.claim.run_id,
+                "audit_run_id": audit.workflow_run_id,
+                "audit_run_attempt": audit.run_attempt,
+                "source_commit_sha": audit.claim.source_commit_sha,
+                "go_sha256": audit.claim.go_sha256,
+                "audit_sha256": audit.envelope_sha256, "observation_scope": scope,
+                "execution_terminated": True, "live_processes": [],
+                "pending_executions": [], "observed_at": NOW.isoformat().replace("+00:00", "Z"),
+            }
+            return sign_envelope(key_id=observer.key_id, private_key=signer, payload=payload)
+
+        kwargs["verify_cycle_safe_stop"] = f4_cycle_control.build_cycle_safe_stop_verifier(
+            observer_key=observer, expected_scope=scope, trusted_signing_keys=self.owner_keys,
+            read_signed_observation=read_signed_observation, now=NOW,
+        )
+        result = delegation.execute_finite_two_cycles(**kwargs)
+        self.assertEqual(result.cycles_completed, 2)
+        self.assertEqual(observed_cycles, [1, 2])
+        self.assertEqual(stopped, ["stop"])
+        self.assertEqual(calls.count((2, "worker")), 1)
+
+    def test_protected_stop_reader_rejects_tampering_and_missing_source(self):
+        import f4_limited_delegation as delegation
+
+        delegation, kwargs, calls, stopped = self._finite_fixture()
+        observer_root = self.root / "stop-observer-reject-test-keys"
+        observer_root.mkdir()
+        observer_signer = EphemeralEd25519(observer_root)
+        observer = TrustedVerificationKey(
+            "stop-observer-reject-fixture", "stop_observer", observer_signer.public_keys["witness"],
+        )
+        scope = {"executor": "isolated-fixture", "process_namespace": "fixture-processes",
+                 "continuation_namespace": "fixture-queue"}
+        signer = type("ObserverSigner", (), {
+            "sign": lambda _self, message: observer_signer.sign("witness", message),
+        })()
+
+        def tampered_reader(*, cycle, stage_receipt, audit):
+            payload = {
+                "schema": 1, "kind": "F4_SAFE_STOP", "repository_id": 1458303357,
+                "cycle": cycle, "worker_run_id": audit.claim.run_id,
+                "audit_run_id": audit.workflow_run_id,
+                "audit_run_attempt": audit.run_attempt,
+                "source_commit_sha": audit.claim.source_commit_sha,
+                "go_sha256": audit.claim.go_sha256,
+                "audit_sha256": audit.envelope_sha256, "observation_scope": scope,
+                "execution_terminated": True, "live_processes": [],
+                "pending_executions": [], "observed_at": NOW.isoformat().replace("+00:00", "Z"),
+            }
+            envelope = sign_envelope(key_id=observer.key_id, private_key=signer, payload=payload)
+            envelope["signature"] = "A" * 88
+            return envelope
+
+        kwargs["verify_cycle_safe_stop"] = f4_cycle_control.build_cycle_safe_stop_verifier(
+            observer_key=observer, expected_scope=scope, trusted_signing_keys=self.owner_keys,
+            read_signed_observation=tampered_reader, now=NOW,
+        )
+        with self.assertRaisesRegex(delegation.DelegationHold, "cycle_safe_stop_unverified"):
+            delegation.execute_finite_two_cycles(**kwargs)
+        self.assertNotIn((2, "worker"), calls)
+        self.assertEqual(stopped, ["stop"])
+        with self.assertRaisesRegex(CycleControlHold, "safe_stop_observation_reader_missing"):
+            f4_cycle_control.build_cycle_safe_stop_verifier(
+                observer_key=observer, expected_scope=scope, trusted_signing_keys=self.owner_keys,
+                read_signed_observation=None, now=NOW,
+            )
+        shared_observer = TrustedVerificationKey(
+            "owner_a-test-key", "stop_observer", self.owner_keys["owner_a-test-key"].public_key,
+        )
+        with self.assertRaisesRegex(CycleControlHold, "stop_observer_key_not_independent"):
+            f4_cycle_control.build_cycle_safe_stop_verifier(
+                observer_key=shared_observer, expected_scope=scope,
+                trusted_signing_keys=self.owner_keys,
+                read_signed_observation=tampered_reader, now=NOW,
+            )
+
+    def test_protected_stop_reader_timeout_holds_without_retry(self):
+        import f4_limited_delegation as delegation
+
+        delegation, timeout_kwargs, timeout_calls, timeout_stopped = self._finite_fixture()
+        observer_root = self.root / "stop-observer-timeout-test-keys"
+        observer_root.mkdir()
+        observer_signer = EphemeralEd25519(observer_root)
+        observer = TrustedVerificationKey(
+            "stop-observer-timeout-fixture", "stop_observer",
+            observer_signer.public_keys["witness"],
+        )
+        scope = {"executor": "isolated-fixture", "process_namespace": "fixture-processes",
+                 "continuation_namespace": "fixture-queue"}
+        read_attempts = []
+
+        def unavailable_reader(*, cycle, stage_receipt, audit):
+            read_attempts.append(cycle)
+            raise TimeoutError("test-only observer unavailable")
+
+        timeout_kwargs["verify_cycle_safe_stop"] = f4_cycle_control.build_cycle_safe_stop_verifier(
+            observer_key=observer, expected_scope=scope,
+            trusted_signing_keys=self.owner_keys,
+            read_signed_observation=unavailable_reader, now=NOW,
+        )
+        with self.assertRaisesRegex(delegation.DelegationHold, "cycle_safe_stop_unverified"):
+            delegation.execute_finite_two_cycles(**timeout_kwargs)
+        self.assertEqual(read_attempts, [1])
+        self.assertNotIn((2, "worker"), timeout_calls)
+        self.assertEqual(timeout_stopped, ["stop"])
+
+    def test_cycle2_stop_observation_timeout_prevents_success(self):
+        import f4_limited_delegation as delegation
+
+        delegation, kwargs, calls, stopped = self._finite_fixture()
+        observer_root = self.root / "stop-observer-cycle2-timeout-test-keys"
+        observer_root.mkdir()
+        observer_signer = EphemeralEd25519(observer_root)
+        observer = TrustedVerificationKey(
+            "stop-observer-cycle2-timeout-fixture", "stop_observer",
+            observer_signer.public_keys["witness"],
+        )
+        scope = {"executor": "isolated-fixture", "process_namespace": "fixture-processes",
+                 "continuation_namespace": "fixture-queue"}
+        signer = type("ObserverSigner", (), {
+            "sign": lambda _self, message: observer_signer.sign("witness", message),
+        })()
+        attempts = []
+
+        def read_signed_observation(*, cycle, stage_receipt, audit):
+            attempts.append(cycle)
+            if cycle == 2:
+                raise TimeoutError("test-only final observer unavailable")
+            payload = {
+                "schema": 1, "kind": "F4_SAFE_STOP", "repository_id": 1458303357,
+                "cycle": cycle, "worker_run_id": audit.claim.run_id,
+                "audit_run_id": audit.workflow_run_id,
+                "audit_run_attempt": audit.run_attempt,
+                "source_commit_sha": audit.claim.source_commit_sha,
+                "go_sha256": audit.claim.go_sha256,
+                "audit_sha256": audit.envelope_sha256, "observation_scope": scope,
+                "execution_terminated": True, "live_processes": [],
+                "pending_executions": [], "observed_at": NOW.isoformat().replace("+00:00", "Z"),
+            }
+            return sign_envelope(key_id=observer.key_id, private_key=signer, payload=payload)
+
+        kwargs["verify_cycle_safe_stop"] = f4_cycle_control.build_cycle_safe_stop_verifier(
+            observer_key=observer, expected_scope=scope, trusted_signing_keys=self.owner_keys,
+            read_signed_observation=read_signed_observation, now=NOW,
+        )
+        with self.assertRaisesRegex(delegation.DelegationHold, "cycle_safe_stop_unverified"):
+            delegation.execute_finite_two_cycles(**kwargs)
+        self.assertEqual(attempts, [1, 2])
         self.assertEqual(calls[-1], (2, "publish-audit"))
         self.assertEqual(stopped, ["stop"])
 

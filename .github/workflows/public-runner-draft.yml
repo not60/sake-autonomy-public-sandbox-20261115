@@ -1,0 +1,647 @@
+name: Public Runner DRAFT_HOLD (manual, disabled)
+
+on:
+  workflow_dispatch:
+    inputs:
+      execution_stage:
+        description: Explicit finite stage; a separate manual dispatch is required after each completed stage
+        required: true
+        type: choice
+        options: ['worker', 'publish-audit']
+        default: 'worker'
+      f4_cycle:
+        description: DRAFT_HOLD cycle selector (never enables jobs)
+        required: false
+        type: choice
+        options: ['1', '2']
+        default: '1'
+      cycle1_auditor_run_id:
+        description: Required source run ID for the Cycle 1 Auditor evidence on Cycle 2
+        required: false
+        type: string
+      f4_go_approval_run_id:
+        description: Run ID containing the externally signed F4 GO approval bundle
+        required: false
+        type: string
+      f4_base_sha:
+        description: Exact public-sandbox main SHA bound by the signed F4 GO
+        required: false
+        type: string
+      publisher_attestation_run_id:
+        description: Run ID containing the independently signed Permit, Witness, and candidate-specific Owner bundle
+        required: false
+        type: string
+      worker_run_id:
+        description: Completed Worker stage run containing the immutable candidate artifact
+        required: false
+        type: string
+
+permissions: {}
+
+jobs:
+  worker:
+    # Hard stop: this local candidate cannot start Codex or a Worker.
+    if: ${{ false && github.ref == 'refs/heads/trusted/f4-nonprod-20261119' && inputs.execution_stage == 'worker' }}
+    environment: f4-worker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out the dispatch revision without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require signed F4 approval bundle run ID
+        env:
+          F4_GO_RUN_ID: ${{ inputs.f4_go_approval_run_id }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+        run: |
+          set -euo pipefail
+          [[ "${F4_GO_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: signed F4 approval bundle run ID missing.' >&2; exit 78; }
+          [[ "${F4_BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || { echo 'HOLD: exact F4 base SHA missing.' >&2; exit 78; }
+      - name: Download externally signed F4 approval bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-formal-go-approval
+          path: ${{ runner.temp }}/b09-f4-go
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.f4_go_approval_run_id }}
+          github-token: ${{ github.token }}
+      - name: Require and download Cycle 1 Auditor artifact for Cycle 2
+        if: ${{ inputs.f4_cycle == '2' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-cycle1-auditor-evidence
+          path: ${{ runner.temp }}/b09-f4-cycle1-auditor-evidence
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.cycle1_auditor_run_id }}
+          github-token: ${{ github.token }}
+      - name: Fail closed when Cycle 2 lacks its signed Auditor envelope
+        if: ${{ inputs.f4_cycle == '2' }}
+        env:
+          F4_CYCLE1_RUN_ID: ${{ inputs.cycle1_auditor_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "${F4_CYCLE1_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: Cycle 1 run ID missing.' >&2; exit 78; }
+          test -s "$RUNNER_TEMP/b09-f4-cycle1-auditor-evidence/auditor-envelope.json" || { echo 'HOLD: signed Auditor envelope missing.' >&2; exit 78; }
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install the pinned verification dependency
+        run: python -m pip install --disable-pip-version-check -r ops/command-tower/requirements-publisher.txt
+      - name: Materialize externally managed F4 trust roots without logging them
+        env:
+          B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
+          B09_F4_AUDITOR_KEY_JSON: ${{ vars.B09_F4_AUDITOR_KEY_JSON }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd() / "ops/command-tower"))
+          from f4_cycle_runtime import _load_auditor_key
+          from trusted_key_registry import load_trusted_verification_keys
+          owner_raw = os.environ.get("B09_F4_TRUSTED_KEYS_JSON", "")
+          auditor_raw = os.environ.get("B09_F4_AUDITOR_KEY_JSON", "")
+          if not owner_raw or not auditor_raw:
+              raise SystemExit("HOLD: externally managed F4 trust roots are not configured.")
+          try:
+              owner = json.loads(owner_raw)
+              auditor = json.loads(auditor_raw)
+              keys = load_trusted_verification_keys(owner)
+              _load_auditor_key(auditor, keys)
+          except Exception:
+              raise SystemExit("HOLD: externally managed F4 trust roots are invalid.") from None
+          root = Path(os.environ["RUNNER_TEMP"]) / "b09-f4-trust"
+          root.mkdir(mode=0o700, parents=True, exist_ok=True)
+          for name, raw in (("trusted-keys.json", owner_raw), ("auditor-key.json", auditor_raw)):
+              fd = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                  stream.write(raw)
+          PY
+      - name: Verify signed F4 GO and atomically claim this Worker cycle
+        env:
+          B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
+          B09_F4_CONTROL_V2_WORKER_BEARER: ${{ secrets.B09_F4_CONTROL_V2_WORKER_BEARER }}
+          GITHUB_TOKEN: ${{ github.token }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+          F4_CYCLE1_AUDITOR_RUN_ID: ${{ inputs.cycle1_auditor_run_id }}
+        run: |
+          set -euo pipefail
+          required=(candidate.json revocation-envelope.json)
+          for item in "${required[@]}"; do test -s "$RUNNER_TEMP/b09-f4-go/$item" || { echo 'HOLD: signed F4 approval bundle incomplete.' >&2; exit 78; }; done
+          args=(--workspace "$GITHUB_WORKSPACE" --expected-base-sha "$F4_BASE_SHA" \
+            --candidate "$RUNNER_TEMP/b09-f4-go/candidate.json" \
+            --revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
+            --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
+            --auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
+            --cycle "$F4_CYCLE" --run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-cycle-$F4_CYCLE" \
+            --source-commit-sha "$GITHUB_SHA")
+          if [[ "$F4_CYCLE" == '2' ]]; then
+            args+=(--operation claim-cycle2 \
+              --auditor-artifact "$RUNNER_TEMP/b09-f4-cycle1-auditor-evidence/auditor-envelope.json" \
+              --cycle1-auditor-run-id "$F4_CYCLE1_AUDITOR_RUN_ID")
+          else
+            args+=(--operation claim-cycle1)
+          fi
+          python ops/command-tower/f4_cycle_runtime.py "${args[@]}"
+      - name: Require an existing Worker-only Codex credential
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo 'HOLD: Worker-only Codex credential is not configured.' >&2
+            exit 78
+          fi
+      - name: Codex candidate generation
+        # Defense in depth: never invoke the Worker from this unsigned draft.
+        if: ${{ false }}
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          working-directory: .
+          sandbox: workspace-write
+          output-file: ${{ runner.temp }}/codex-final-message.txt
+          prompt: |
+            This workflow remains DRAFT_HOLD. Read the local public runner
+            backlog. If it is unsigned or not SIGNED_GO, stop without editing
+            files. Do not call GitHub APIs or perform publication.
+      - name: Package exact candidate bytes and hash manifest
+        env:
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
+        run: |
+          set -euo pipefail
+          allowed_paths=(
+            ops/command-tower/policy-public-runner.draft.json
+            ops/command-tower/runtime-public-runner.draft.json
+            ops/command-tower/backlog-public-runner.draft.json
+            ops/command-tower/test_public_runner_draft_contract.py
+            ops/command-tower/isolated_runtime.py
+            ops/command-tower/test_isolated_runtime.py
+            ops/command-tower/durable_store.py
+            ops/command-tower/test_durable_store.py
+            ops/command-tower/test_process_crash_recovery.py
+            ops/command-tower/publisher_gate.py
+            ops/command-tower/runner_artifact.py
+            ops/command-tower/cas_journal.py
+            ops/command-tower/attestations.py
+            ops/command-tower/requirements-publisher.txt
+            ops/command-tower/test_cas_journal.py
+            ops/command-tower/test_durable_permit_identity.py
+            ops/command-tower/test_publisher_gate.py
+            ops/command-tower/test_publisher_gate_crypto.py
+            ops/command-tower/test_runner_artifact.py
+          )
+          args=()
+          for path in "${allowed_paths[@]}"; do args+=(--allowed-path "$path"); done
+          python ops/command-tower/runner_artifact.py \
+            --worktree-root "$GITHUB_WORKSPACE" \
+            --output-root "$RUNNER_TEMP/b09-bundle" \
+            --repository-id 1458303357 \
+            --base-sha "$F4_BASE_SHA" \
+            --worker-run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-cycle-$F4_CYCLE" \
+            --codex-output-file "$RUNNER_TEMP/codex-final-message.txt" \
+            "${args[@]}"
+      - name: Transfer the untrusted candidate bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: b09-public-runner-candidate
+          path: ${{ runner.temp }}/b09-bundle/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Transfer immutable Worker claim receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: b09-f4-worker-claim-receipt
+          path: ${{ runner.temp }}/f4-worker-claim-receipt.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publisher:
+    outputs:
+      pr_number: ${{ steps.publish.outputs.pr_number }}
+      pr_head_sha: ${{ steps.publish.outputs.pr_head_sha }}
+      pr_base_sha: ${{ steps.publish.outputs.pr_base_sha }}
+    # Hard stop. This role is only a permission candidate; it has no write step.
+    if: ${{ false && github.ref == 'refs/heads/trusted/f4-nonprod-20261119' && inputs.execution_stage == 'publish-audit' }}
+    environment: f4-publisher
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Check out the same dispatch revision without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the protected Publisher source revision
+        env:
+          EXPECTED_TRUSTED_REF: refs/heads/trusted/f4-nonprod-20261119
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "$EXPECTED_TRUSTED_REF" || { echo 'HOLD: Publisher must run from the protected trusted ref.' >&2; exit 78; }
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'HOLD: trusted source revision is invalid.' >&2; exit 78; }
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA" || { echo 'HOLD: checkout differs from dispatch revision.' >&2; exit 78; }
+          test -z "$(git status --porcelain --untracked-files=no)" || { echo 'HOLD: trusted source checkout is modified.' >&2; exit 78; }
+          for path in .github/workflows/public-runner-draft.yml ops/command-tower/publisher_gate.py ops/command-tower/draft_pr_writer.py ops/command-tower/requirements-publisher.txt; do
+            git cat-file -e "$GITHUB_SHA:$path" || { echo 'HOLD: trusted source closure is incomplete.' >&2; exit 78; }
+          done
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install the pinned verification dependency
+        run: python -m pip install --disable-pip-version-check -r ops/command-tower/requirements-publisher.txt
+      - name: Verify Publisher imports resolve only from the trusted revision
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib, pathlib, sys
+          root = (pathlib.Path.cwd() / 'ops/command-tower').resolve(strict=True)
+          sys.path.insert(0, str(root))
+          modules = ('publisher_gate', 'draft_pr_writer', 'f4_cycle_runtime',
+                     'f4_limited_delegation', 'cas_journal', 'durable_store',
+                     'trusted_key_registry', 'attestations')
+          for name in modules:
+              module = importlib.import_module(name)
+              path = pathlib.Path(module.__file__).resolve(strict=True)
+              try:
+                  path.relative_to(root)
+              except ValueError:
+                  raise SystemExit('HOLD: Publisher import escaped trusted source.') from None
+          PY
+      - name: Require completed Worker and signed-attestation source run IDs
+        env:
+          WORKER_RUN_ID: ${{ inputs.worker_run_id }}
+          ATTESTATION_RUN_ID: ${{ inputs.publisher_attestation_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "${WORKER_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: completed Worker run ID missing.' >&2; exit 78; }
+          [[ "${ATTESTATION_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: signed Publisher bundle run ID missing.' >&2; exit 78; }
+      - name: Download externally signed F4 approval bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-formal-go-approval
+          path: ${{ runner.temp }}/b09-f4-go
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.f4_go_approval_run_id }}
+          github-token: ${{ github.token }}
+      - name: Materialize externally managed F4 trust roots without logging them
+        env:
+          B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
+          B09_F4_AUDITOR_KEY_JSON: ${{ vars.B09_F4_AUDITOR_KEY_JSON }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd() / "ops/command-tower"))
+          from f4_cycle_runtime import _load_auditor_key
+          from trusted_key_registry import load_trusted_verification_keys
+          owner_raw = os.environ.get("B09_F4_TRUSTED_KEYS_JSON", "")
+          auditor_raw = os.environ.get("B09_F4_AUDITOR_KEY_JSON", "")
+          if not owner_raw or not auditor_raw:
+              raise SystemExit("HOLD: externally managed F4 trust roots are not configured.")
+          try:
+              owner = json.loads(owner_raw)
+              auditor = json.loads(auditor_raw)
+              keys = load_trusted_verification_keys(owner)
+              _load_auditor_key(auditor, keys)
+          except Exception:
+              raise SystemExit("HOLD: externally managed F4 trust roots are invalid.") from None
+          root = Path(os.environ["RUNNER_TEMP"]) / "b09-f4-trust"
+          root.mkdir(mode=0o700, parents=True, exist_ok=True)
+          for name, raw in (("trusted-keys.json", owner_raw), ("auditor-key.json", auditor_raw)):
+              fd = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                  stream.write(raw)
+          PY
+      - name: Download worker bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-public-runner-candidate
+          path: ${{ runner.temp }}/b09-bundle
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.worker_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download independently issued Publisher bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-public-runner-signed-attestations
+          path: ${{ runner.temp }}/b09-signed-attestations
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.publisher_attestation_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download immutable Worker claim receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-worker-claim-receipt
+          path: ${{ runner.temp }}/b09-f4-claim
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.worker_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify exact bytes, Permit, Witness, and durable single use
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          B09_F4_CONTROL_V2_READ_BEARER: ${{ secrets.B09_F4_CONTROL_V2_READ_BEARER }}
+          WORKER_RUN_ID: ${{ inputs.worker_run_id }}
+          EXPECTED_EXECUTION_SHA: ${{ github.sha }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
+          PUBLISHER_ATTESTATION_RUN_ID: ${{ inputs.publisher_attestation_run_id }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+          B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
+          B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
+          B09_CAS_V2_PUBLISHER_BEARER: ${{ secrets.B09_CAS_V2_PUBLISHER_BEARER }}
+          B09_PUBLISHER_GITHUB_APP_PRIVATE_KEY_PEM: ${{ secrets.B09_PUBLISHER_GITHUB_APP_PRIVATE_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          [[ "${PUBLISHER_ATTESTATION_RUN_ID:-}" =~ ^[0-9]+$ ]] || { echo 'HOLD: independent signed Publisher bundle run ID missing.' >&2; exit 78; }
+          for item in permit.json witness.json owner-approvals.json; do
+            test -s "$RUNNER_TEMP/b09-signed-attestations/$item" || { echo 'HOLD: independent signed Publisher bundle incomplete.' >&2; exit 78; }
+          done
+          test -s "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" || { echo 'HOLD: externally managed signing keys missing.' >&2; exit 78; }
+          allowed_paths=(
+            ops/command-tower/policy-public-runner.draft.json
+            ops/command-tower/runtime-public-runner.draft.json
+            ops/command-tower/backlog-public-runner.draft.json
+            ops/command-tower/test_public_runner_draft_contract.py
+            ops/command-tower/isolated_runtime.py
+            ops/command-tower/test_isolated_runtime.py
+            ops/command-tower/durable_store.py
+            ops/command-tower/test_durable_store.py
+            ops/command-tower/test_process_crash_recovery.py
+            ops/command-tower/publisher_gate.py
+            ops/command-tower/runner_artifact.py
+            ops/command-tower/cas_journal.py
+            ops/command-tower/attestations.py
+            ops/command-tower/requirements-publisher.txt
+            ops/command-tower/test_cas_journal.py
+            ops/command-tower/test_durable_permit_identity.py
+            ops/command-tower/test_publisher_gate.py
+            ops/command-tower/test_publisher_gate_crypto.py
+            ops/command-tower/test_runner_artifact.py
+          )
+          args=()
+          for path in "${allowed_paths[@]}"; do args+=(--allowed-path "$path"); done
+          result="$(python ops/command-tower/publisher_gate.py \
+            --artifact-root "$RUNNER_TEMP/b09-bundle/files" \
+            --manifest "$RUNNER_TEMP/b09-bundle/manifest.json" \
+            --permit "$RUNNER_TEMP/b09-signed-attestations/permit.json" \
+            --witness "$RUNNER_TEMP/b09-signed-attestations/witness.json" \
+            --codex-output "$RUNNER_TEMP/b09-bundle/evidence/codex-output.bin" \
+            --owner-approvals "$RUNNER_TEMP/b09-signed-attestations/owner-approvals.json" \
+            --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
+            --database "$RUNNER_TEMP/publisher-journal.sqlite3" \
+            --repository-id 1458303357 \
+            --base-sha "$F4_BASE_SHA" \
+            --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
+            --role publisher \
+            --f4-workspace "$GITHUB_WORKSPACE" \
+            --f4-candidate "$RUNNER_TEMP/b09-f4-go/candidate.json" \
+            --f4-revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
+            --f4-auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
+            --f4-worker-run-id "$WORKER_RUN_ID" \
+            --f4-execution-sha "$EXPECTED_EXECUTION_SHA" \
+            --f4-cycle "$F4_CYCLE" \
+            --f4-claim-receipt "$RUNNER_TEMP/b09-f4-claim/f4-worker-claim-receipt.json" \
+            --draft-pr-write \
+            "${args[@]}")"
+          printf '%s\n' "$result"
+          if [[ "$result" =~ ^DRAFT_PR_CREATED:([0-9]+):([0-9a-f]{40}):([0-9a-f]{40}):https://github\.com/not60/sake-autonomy-public-sandbox-20261115/pull/[0-9]+$ ]]; then
+            printf 'pr_number=%s\n' "${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+            printf 'pr_head_sha=%s\n' "${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+            printf 'pr_base_sha=%s\n' "${BASH_REMATCH[3]}" >> "$GITHUB_OUTPUT"
+          else
+            echo 'HOLD: publisher did not return a validated Draft PR reference.' >&2
+            exit 78
+          fi
+
+  auditor:
+    needs: [publisher]
+    # Hard stop. Independent verification is wired but not started in DRAFT_HOLD.
+    if: ${{ false && github.ref == 'refs/heads/trusted/f4-nonprod-20261119' && inputs.execution_stage == 'publish-audit' }}
+    environment: f4-auditor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    steps:
+      - name: Check out the same dispatch revision without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download externally signed F4 approval bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-formal-go-approval
+          path: ${{ runner.temp }}/b09-f4-go
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.f4_go_approval_run_id }}
+          github-token: ${{ github.token }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install the pinned verification dependency
+        run: python -m pip install --disable-pip-version-check -r ops/command-tower/requirements-publisher.txt
+      - name: Materialize externally managed F4 trust roots without logging them
+        env:
+          B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
+          B09_F4_AUDITOR_KEY_JSON: ${{ vars.B09_F4_AUDITOR_KEY_JSON }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd() / "ops/command-tower"))
+          from f4_cycle_runtime import _load_auditor_key
+          from trusted_key_registry import load_trusted_verification_keys
+          owner_raw = os.environ.get("B09_F4_TRUSTED_KEYS_JSON", "")
+          auditor_raw = os.environ.get("B09_F4_AUDITOR_KEY_JSON", "")
+          if not owner_raw or not auditor_raw:
+              raise SystemExit("HOLD: externally managed F4 trust roots are not configured.")
+          try:
+              owner = json.loads(owner_raw)
+              auditor = json.loads(auditor_raw)
+              keys = load_trusted_verification_keys(owner)
+              _load_auditor_key(auditor, keys)
+          except Exception:
+              raise SystemExit("HOLD: externally managed F4 trust roots are invalid.") from None
+          root = Path(os.environ["RUNNER_TEMP"]) / "b09-f4-trust"
+          root.mkdir(mode=0o700, parents=True, exist_ok=True)
+          for name, raw in (("trusted-keys.json", owner_raw), ("auditor-key.json", auditor_raw)):
+              fd = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                  stream.write(raw)
+          PY
+      - name: Independently download the original worker bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-public-runner-candidate
+          path: ${{ runner.temp }}/b09-bundle
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.worker_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download the same independently issued Publisher bundle for read-only audit
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-public-runner-signed-attestations
+          path: ${{ runner.temp }}/b09-signed-attestations
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.publisher_attestation_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download immutable Worker claim receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-worker-claim-receipt
+          path: ${{ runner.temp }}/b09-f4-claim
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.worker_run_id }}
+          github-token: ${{ github.token }}
+      - name: Independently verify completed Worker run and artifact provenance
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WORKER_RUN_ID: ${{ inputs.worker_run_id }}
+          EXPECTED_BASE_SHA: ${{ inputs.f4_base_sha }}
+          EXPECTED_EXECUTION_SHA: ${{ github.sha }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
+          B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
+          B09_F4_CONTROL_V2_READ_BEARER: ${{ secrets.B09_F4_CONTROL_V2_READ_BEARER }}
+        run: |
+          set -euo pipefail
+          python ops/command-tower/f4_cycle_runtime.py \
+            --operation verify-worker-receipt --workspace "$GITHUB_WORKSPACE" \
+            --expected-base-sha "$EXPECTED_BASE_SHA" --source-commit-sha "$EXPECTED_EXECUTION_SHA" \
+            --cycle "$F4_CYCLE" --run-id "$WORKER_RUN_ID" \
+            --candidate "$RUNNER_TEMP/b09-f4-go/candidate.json" \
+            --revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
+            --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
+            --auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
+            --worker-manifest "$RUNNER_TEMP/b09-bundle/manifest.json" \
+            --claim-receipt "$RUNNER_TEMP/b09-f4-claim/f4-worker-claim-receipt.json"
+      - name: Independently verify hashes and signed attestations
+        env:
+          B09_F4_TRUSTED_KEYS_JSON: ${{ vars.B09_F4_TRUSTED_KEYS_JSON }}
+          B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
+          B09_CAS_V2_AUDITOR_BEARER: ${{ secrets.B09_CAS_V2_AUDITOR_BEARER }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          B09_PR_NUMBER: ${{ needs.publisher.outputs.pr_number }}
+          B09_PR_HEAD_SHA: ${{ needs.publisher.outputs.pr_head_sha }}
+          B09_PR_BASE_SHA: ${{ needs.publisher.outputs.pr_base_sha }}
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" || { echo 'HOLD: externally managed signing keys missing.' >&2; exit 78; }
+          allowed_paths=(
+            ops/command-tower/policy-public-runner.draft.json
+            ops/command-tower/runtime-public-runner.draft.json
+            ops/command-tower/backlog-public-runner.draft.json
+            ops/command-tower/test_public_runner_draft_contract.py
+            ops/command-tower/isolated_runtime.py
+            ops/command-tower/test_isolated_runtime.py
+            ops/command-tower/durable_store.py
+            ops/command-tower/test_durable_store.py
+            ops/command-tower/test_process_crash_recovery.py
+            ops/command-tower/publisher_gate.py
+            ops/command-tower/runner_artifact.py
+            ops/command-tower/cas_journal.py
+            ops/command-tower/attestations.py
+            ops/command-tower/requirements-publisher.txt
+            ops/command-tower/test_cas_journal.py
+            ops/command-tower/test_durable_permit_identity.py
+            ops/command-tower/test_publisher_gate.py
+            ops/command-tower/test_publisher_gate_crypto.py
+            ops/command-tower/test_runner_artifact.py
+          )
+          args=()
+          for path in "${allowed_paths[@]}"; do args+=(--allowed-path "$path"); done
+          python ops/command-tower/publisher_gate.py \
+            --artifact-root "$RUNNER_TEMP/b09-bundle/files" \
+            --manifest "$RUNNER_TEMP/b09-bundle/manifest.json" \
+            --permit "$RUNNER_TEMP/b09-signed-attestations/permit.json" \
+            --witness "$RUNNER_TEMP/b09-signed-attestations/witness.json" \
+            --codex-output "$RUNNER_TEMP/b09-bundle/evidence/codex-output.bin" \
+            --owner-approvals "$RUNNER_TEMP/b09-signed-attestations/owner-approvals.json" \
+            --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
+            --database "$RUNNER_TEMP/auditor-journal.sqlite3" \
+            --repository-id 1458303357 \
+            --base-sha "$F4_BASE_SHA" \
+            --cas-endpoint "${B09_CAS_ENDPOINT:-}" \
+            --role auditor \
+            --audit-pr-ci \
+            --pull-request-number "$B09_PR_NUMBER" \
+            --expected-pr-head-sha "$B09_PR_HEAD_SHA" \
+            --expected-pr-base-sha "$B09_PR_BASE_SHA" \
+            --f4-audit-evidence-output "$RUNNER_TEMP/f4-audit-evidence.json" \
+            "${args[@]}"
+      - name: Sign Cycle 1 Auditor evidence with its independent key
+        if: ${{ inputs.f4_cycle == '1' }}
+        env:
+          B09_F4_AUDITOR_PRIVATE_KEY_PKCS8_B64: ${{ secrets.B09_F4_AUDITOR_PRIVATE_KEY_PKCS8_B64 }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+        run: |
+          set -euo pipefail
+          python ops/command-tower/f4_auditor_artifact.py \
+            --evidence "$RUNNER_TEMP/f4-audit-evidence.json" \
+            --candidate "$RUNNER_TEMP/b09-f4-go/candidate.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --expected-base-sha "$F4_BASE_SHA" \
+            --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
+            --auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
+            --revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-commit-sha "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/b09-f4-cycle1-auditor-envelope.json"
+      - name: Require Cycle 1 signed Auditor envelope and upload immutable handoff
+        if: ${{ inputs.f4_cycle == '1' }}
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/b09-f4-cycle1-auditor-envelope.json" || { echo 'HOLD: independent signed Auditor envelope was not produced.' >&2; exit 78; }
+          mkdir -p "$RUNNER_TEMP/b09-f4-cycle1-auditor-evidence"
+          install -m 600 "$RUNNER_TEMP/b09-f4-cycle1-auditor-envelope.json" "$RUNNER_TEMP/b09-f4-cycle1-auditor-evidence/auditor-envelope.json"
+      - name: Upload signed Cycle 1 Auditor handoff
+        if: ${{ inputs.f4_cycle == '1' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: b09-f4-cycle1-auditor-evidence
+          path: ${{ runner.temp }}/b09-f4-cycle1-auditor-evidence/auditor-envelope.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Record signed Cycle 1 Auditor evidence in the F4 CAS journal
+        if: ${{ inputs.f4_cycle == '1' }}
+        env:
+          B09_CAS_ENDPOINT: ${{ vars.B09_CAS_ENDPOINT }}
+          B09_F4_CONTROL_V2_AUDITOR_BEARER: ${{ secrets.B09_F4_CONTROL_V2_AUDITOR_BEARER }}
+          GITHUB_TOKEN: ${{ github.token }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+        run: |
+          set -euo pipefail
+          python ops/command-tower/f4_cycle_runtime.py \
+            --operation record-cycle1-audit \
+            --workspace "$GITHUB_WORKSPACE" \
+            --expected-base-sha "$F4_BASE_SHA" \
+            --candidate "$RUNNER_TEMP/b09-f4-go/candidate.json" \
+            --revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
+            --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
+            --auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
+            --auditor-artifact "$RUNNER_TEMP/b09-f4-cycle1-auditor-evidence/auditor-envelope.json"
+      - name: End Cycle 2 in SAFE STOP
+        if: ${{ inputs.f4_cycle == '2' }}
+        env:
+          F4_CYCLE: ${{ inputs.f4_cycle }}
+        run: |
+          set -euo pipefail
+          test "$F4_CYCLE" = '2'
+          echo 'F4_CYCLE2_AUDITOR_COMPLETE_SAFE_STOP'

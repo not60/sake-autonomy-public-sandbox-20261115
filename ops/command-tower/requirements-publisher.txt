@@ -1,0 +1,2 @@
+# Pin the Ed25519 verification provider used by publisher_gate.py.
+cryptography==50.0.2

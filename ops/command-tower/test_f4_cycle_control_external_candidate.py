@@ -1,0 +1,169 @@
+"""Targeted static checks for the un-deployed F4 external integration candidate."""
+from pathlib import Path
+import re
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+MIGRATION = ROOT / "ops/command-tower/supabase-cas-draft/migrations/20261119000100_f4_cycle_control.sql"
+ROLLBACK = ROOT / "ops/command-tower/supabase-cas-draft/migrations/20261119000100_f4_cycle_control.rollback.sql"
+EDGE = ROOT / "ops/command-tower/supabase-cas-draft/supabase/functions/sake-cas-v1/cycle_control.ts"
+INDEX = ROOT / "ops/command-tower/supabase-cas-draft/supabase/functions/sake-cas-v1/index.ts"
+WORKFLOW = ROOT / ".github/workflows/public-runner-draft.yml"
+
+
+class F4ExternalCandidateTests(unittest.TestCase):
+    @staticmethod
+    def _fixture_membership_guard(memberships, effective):
+        expected = {
+            "granted_role": "sake_b09_cas_edge",
+            "member_role": "postgres",
+            "grantor_role": "supabase_admin",
+            "admin_option": True,
+            "inherit_option": False,
+            "set_option": False,
+        }
+        return (
+            memberships == [expected]
+            and effective == {
+                "postgres_edge_usage": False,
+                "postgres_edge_set": False,
+                "edge_postgres_member": False,
+            }
+        )
+
+    def test_migration_accepts_only_the_exact_admin_membership_fixture(self) -> None:
+        migration = MIGRATION.read_text(encoding="utf-8")
+        self.assertIn("edge_membership_count <> 1", migration)
+        self.assertIn("m.roleid = edge_role_oid AND m.member = postgres_role_oid", migration)
+        self.assertIn("m.grantor = admin_role_oid", migration)
+        self.assertIn("m.admin_option IS TRUE", migration)
+        self.assertIn("m.inherit_option IS FALSE", migration)
+        self.assertIn("m.set_option IS FALSE", migration)
+        self.assertIn("pg_has_role('postgres', 'sake_b09_cas_edge', 'USAGE') IS DISTINCT FROM FALSE", migration)
+        self.assertIn("pg_has_role('postgres', 'sake_b09_cas_edge', 'SET') IS DISTINCT FROM FALSE", migration)
+        self.assertIn("pg_has_role('sake_b09_cas_edge', 'postgres', 'MEMBER') IS DISTINCT FROM FALSE", migration)
+        self.assertIn("ADMIN OPTION intentionally leaves them able to manage this membership later", migration)
+
+        exact = [{
+            "granted_role": "sake_b09_cas_edge",
+            "member_role": "postgres",
+            "grantor_role": "supabase_admin",
+            "admin_option": True,
+            "inherit_option": False,
+            "set_option": False,
+        }]
+        effective = {
+            "postgres_edge_usage": False,
+            "postgres_edge_set": False,
+            "edge_postgres_member": False,
+        }
+        self.assertTrue(self._fixture_membership_guard(exact, effective))
+
+        mutations = {
+            "additional membership": exact + [{**exact[0], "member_role": "other_role"}],
+            "reverse membership": [{**exact[0], "granted_role": "postgres", "member_role": "sake_b09_cas_edge"}],
+            "grantor mismatch": [{**exact[0], "grantor_role": "other_admin"}],
+            "ADMIN mismatch": [{**exact[0], "admin_option": False}],
+            "ADMIN unknown": [{**exact[0], "admin_option": None}],
+            "INHERIT mismatch": [{**exact[0], "inherit_option": True}],
+            "INHERIT unknown": [{**exact[0], "inherit_option": None}],
+            "SET mismatch": [{**exact[0], "set_option": True}],
+            "SET unknown": [{**exact[0], "set_option": None}],
+        }
+        for label, candidate in mutations.items():
+            with self.subTest(case=label):
+                self.assertFalse(self._fixture_membership_guard(candidate, effective))
+
+        for key in effective:
+            with self.subTest(case=f"effective privilege {key}"):
+                self.assertFalse(
+                    self._fixture_membership_guard(exact, {**effective, key: True})
+                )
+        with self.subTest(case="unknown effective privilege"):
+            self.assertFalse(
+                self._fixture_membership_guard(exact, {**effective, "postgres_edge_set": None})
+            )
+
+    def test_migration_is_transactional_fixed_key_only_and_non_destructive(self) -> None:
+        sql = MIGRATION.read_text(encoding="utf-8")
+        self.assertTrue(sql.startswith("-- LOCAL DRAFT ONLY"))
+        self.assertRegex(sql, r"(?m)^BEGIN;$")
+        self.assertRegex(sql, r"(?m)^COMMIT;$")
+        self.assertIn("documents_fixed_public_repo_key", sql)
+        for key in (
+            "repositories/1458303357/b09-permit-journal-v1.json",
+            "repositories/1458303357/b09-permit-journal-test-v1.json",
+            "repositories/1458303357/b09-f4-cycle-control-v1.json",
+            "repositories/1458303357/b09-f4-cycle-control-test-v1.json",
+        ):
+            self.assertIn(key, sql)
+        self.assertNotRegex(sql, r"(?i)\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE)\b")
+        self.assertIn("ON CONFLICT (cas_key) DO NOTHING", sql)
+        self.assertIn("WHERE cas_key = p_key AND revision = p_expected_revision", sql)
+        self.assertIn("RAISE EXCEPTION 'F4 migration RLS policy drift'", sql)
+        self.assertIn("F4 cycle-control key already exists; do not overwrite", sql)
+        policy = sql.split("CREATE POLICY b09_edge_fixed_key_only", 1)[1].split(
+            "CREATE OR REPLACE FUNCTION", 1
+        )[0]
+        rpcs = sql.split("CREATE OR REPLACE FUNCTION sake_cas_private.insert_if_absent", 1)[1]
+        self.assertNotIn("b09-permit-journal-test-v1.json", policy + rpcs)
+
+    def test_rollback_is_guarded_and_never_deletes_cycle_records(self) -> None:
+        sql = ROLLBACK.read_text(encoding="utf-8")
+        self.assertTrue(sql.startswith("-- LOCAL DRAFT ONLY"))
+        self.assertRegex(sql, r"(?m)^BEGIN;$")
+        self.assertRegex(sql, r"(?m)^COMMIT;$")
+        self.assertIn("rollback refused: F4 cycle-control records exist", sql)
+        self.assertIn("rollback refused: schema or RLS policy drift", sql)
+        self.assertNotRegex(sql, r"(?i)\b(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE)\b")
+        self.assertIn("documents_fixed_public_repo_key", sql)
+        self.assertIn("b09-f4-cycle-control-test-v1.json", sql)
+        policy = sql.split("CREATE POLICY b09_edge_fixed_key_only", 1)[1].split(
+            "CREATE OR REPLACE FUNCTION", 1
+        )[0]
+        rpcs = sql.split("CREATE OR REPLACE FUNCTION sake_cas_private.insert_if_absent", 1)[1]
+        self.assertNotIn("b09-permit-journal-test-v1.json", policy + rpcs)
+
+    def test_edge_boundary_is_separate_and_cycle_two_requires_auditor_event(self) -> None:
+        edge = EDGE.read_text(encoding="utf-8")
+        index = INDEX.read_text(encoding="utf-8")
+        core = (ROOT / "ops/command-tower/supabase-cas-draft/supabase/functions/sake-cas-v1/core.ts").read_text(encoding="utf-8")
+        for role in ("OWNER", "WORKER", "AUDITOR", "READ", "TEST_OWNER", "TEST_WORKER", "TEST_AUDITOR", "TEST_READ"):
+            self.assertIn(f"B09_F4_CONTROL_V2_{role}_BEARER", core)
+        self.assertIn("F4_TOKEN_ENV.owner", edge)
+        self.assertIn("F4_TOKEN_ENV.worker", edge)
+        self.assertIn("F4_TOKEN_ENV.auditor", edge)
+        self.assertIn("readV2RoleTokens", edge)
+        self.assertIn("event.event === \"CYCLE_CLAIMED\" ? role === \"worker\"", edge)
+        self.assertIn("event.event === \"CYCLE1_AUDITOR_PASS\" ? role === \"auditor\"", edge)
+        self.assertIn("cycle === 2 && (!audited || claims.length !== 1)", edge)
+        self.assertIn("constantEqual", edge)
+        self.assertIn("if-match", edge)
+        self.assertIn("updateIfRevision", edge)
+        self.assertIn("handleF4ControlRequest", index)
+        self.assertIn("...F4_CONTROL_KEYS", index)
+        self.assertNotIn("b09-permit-journal-test-v1.json", index)
+
+    def test_workflow_cross_run_artifact_path_is_pinned_and_jobs_remain_hard_disabled(self) -> None:
+        source = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("options: ['worker', 'publish-audit']", source)
+        self.assertNotRegex(source, r"(?m)^  workflow_run:")
+        self.assertIn("cycle1_auditor_run_id:", source)
+        self.assertIn("name: b09-f4-cycle1-auditor-evidence", source)
+        self.assertIn("run-id: ${{ inputs.cycle1_auditor_run_id }}", source)
+        self.assertIn("actions: read", source)
+        self.assertIn("signed Auditor envelope missing", source)
+        self.assertIn("if: ${{ false }}", source)
+        for job_name, next_name in (("worker", "publisher"), ("publisher", "auditor")):
+            start = source.index(f"  {job_name}:\n")
+            end = source.index(f"  {next_name}:\n", start)
+            self.assertRegex(source[start:end], r"(?m)^    if: \$\{\{ false(?: &&[^\n]*)? \}\}$")
+        auditor = source[source.index("  auditor:\n"):]
+        self.assertRegex(auditor, r"(?m)^    if: \$\{\{ false(?: &&[^\n]*)? \}\}$")
+        uses = re.findall(r"(?m)^\s+uses:\s+[^@\s]+@([^\s#]+)", source)
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in uses))
+
+
+if __name__ == "__main__":
+    unittest.main()

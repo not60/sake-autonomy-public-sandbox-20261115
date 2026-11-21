@@ -470,3 +470,27 @@ def build_delegation_status_reader(*, backend, trusted_owner_keys, environment, 
         expected_contract_sha256=hashlib.sha256(canonical_json(delegation_payload)).hexdigest(),
         expected_revision=delegation_payload["execution_revision"],
     )
+
+
+def build_cycle2_audit_digest_reader(*, journal, reader, archive_path, run_id, attempt,
+                                    candidate, go, claim, previous, publication_reader):
+    """Return the Cycle2 digest only after the existing archive/provenance verifier seals it."""
+    from f4_auditor_artifact import verify_cycle2_archive
+    from f4_cycle_control import is_verified_stage_audit
+    from pathlib import Path
+    path = Path(archive_path)
+    if (path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024
+            or claim.cycle != 2 or previous is None or previous.claim.cycle != 1):
+        raise SigningCliHold("cycle2_audit_archive_unavailable_or_unscoped")
+    archive = path.read_bytes()
+    try:
+        result = verify_cycle2_archive(
+            journal=journal, reader=reader, archive=archive, run_id=run_id,
+            attempt=attempt, candidate=candidate, go=go, claim=claim,
+            previous=previous, publication_reader=publication_reader,
+        )
+    except Exception:
+        raise SigningCliHold("cycle2_audit_verification_failed") from None
+    if not is_verified_stage_audit(result, claim, previous):
+        raise SigningCliHold("cycle2_audit_not_independently_verified")
+    return lambda: result.envelope_sha256

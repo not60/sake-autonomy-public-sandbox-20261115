@@ -1,6 +1,6 @@
 /** DRAFT_HOLD. Existing F4 Owner/read credentials; no Permit credential reuse. */
 import { casAuthGenerationFailure, resolveFixedCasRoute, DELEGATION_KEY, type CasDependencies } from './core.ts';
-import { identify, loadOwnerKeys, canonical, sha256 } from './cycle_control.ts';
+import { identify, loadOwnerKeys, canonical, sha256, ownedCryptoBuffer } from './cycle_control.ts';
 const reply = (status: number) => new Response(null, {status, headers: {'cache-control':'no-store'}});
 const exact = (v: any, fields: string[]) => v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).sort().join(',') === fields.sort().join(',');
 export async function validateDelegationDocument(body: string, mode: string, env: CasDependencies['env'], fresh = true): Promise<any> {
@@ -22,8 +22,8 @@ export async function validateDelegationDocument(body: string, mode: string, env
     const a = e.approvals[role], k = keys.get(a?.key_id);
     if (!exact(a,['key_id','signature']) || !k || k.role !== role) throw Error('status_owner');
     const raw = Uint8Array.from(atob(a.signature), c=>c.charCodeAt(0));
-    const key = await crypto.subtle.importKey('raw', k.public_key, {name:'Ed25519'}, false, ['verify']);
-    if (!await crypto.subtle.verify('Ed25519', key, raw, new TextEncoder().encode(canonical(p)))) throw Error('status_signature');
+    const key = await crypto.subtle.importKey('raw', ownedCryptoBuffer(k.public_key), {name:'Ed25519'}, false, ['verify']);
+    if (!await crypto.subtle.verify('Ed25519', key, ownedCryptoBuffer(raw), ownedCryptoBuffer(new TextEncoder().encode(canonical(p))))) throw Error('status_signature');
   }
   if (d.head_sha256 !== await sha256(canonical(e))) throw Error('status_hash');
   return p;

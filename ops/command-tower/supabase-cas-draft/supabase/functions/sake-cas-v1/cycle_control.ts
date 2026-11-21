@@ -342,8 +342,9 @@ async function verifyEnvelope(envelope: Record<string, unknown>, key: Verificati
   try {
     const signature = decodeBase64(envelope.signature);
     if (signature.length !== 64) return false;
-    const cryptoKey = await crypto.subtle.importKey("raw", key.public_key, { name: "Ed25519" }, false, ["verify"]);
-    return await crypto.subtle.verify({ name: "Ed25519" }, cryptoKey, signature, encoder.encode(canonical(expectedPayload)));
+    const cryptoKey = await crypto.subtle.importKey("raw", ownedCryptoBuffer(key.public_key), { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "Ed25519" }, cryptoKey,
+      ownedCryptoBuffer(signature), ownedCryptoBuffer(encoder.encode(canonical(expectedPayload))));
   } catch { return false; }
 }
 
@@ -375,6 +376,12 @@ function decodeBase64(value: string): Uint8Array {
   const bytes = Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
   if (btoa(String.fromCharCode(...bytes)) !== value) throw new Error("base64_invalid");
   return bytes;
+}
+
+export function ownedCryptoBuffer(value: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(value.byteLength);
+  copy.set(value);
+  return copy.buffer;
 }
 
 function constantEqualBytes(left: Uint8Array, right: Uint8Array): boolean {

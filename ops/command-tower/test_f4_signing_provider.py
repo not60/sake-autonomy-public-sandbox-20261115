@@ -235,7 +235,10 @@ class SigningProviderContractTests(unittest.TestCase):
 
         fixture = F4CycleControlTests()
         fixture.setUp()
+        # setUp() is called directly here, so unittest will not automatically
+        # run this fixture's registered cleanup callbacks (including patches).
         self.addCleanup(fixture.tearDown)
+        self.addCleanup(fixture.doCleanups)
         cycle1_run, cycle2_run = "101-1-cycle-1", "102-1-cycle-2"
         cycle1_source = cycle2_source = "b" * 40
         state1 = fixture.control.claim_cycle(

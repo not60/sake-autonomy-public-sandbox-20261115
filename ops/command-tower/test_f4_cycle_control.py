@@ -600,6 +600,90 @@ class F4CycleControlTests(unittest.TestCase):
                 verify_github_artifact=self._provenance, now=NOW,
             )
 
+    def test_cycle1_audit_rehydrates_from_cas_for_later_cycle_readonly(self) -> None:
+        from f4_cycle_control import is_verified_stage_audit
+
+        state1 = self.control.claim_cycle(
+            candidate=self.candidate, go=self.go, cycle_number=1,
+            run_id="101-1-cycle-1", source_commit_sha="b" * 40, now=NOW,
+        )
+        base = self._artifact()["payload"]
+        artifact = build_cycle1_auditor_artifact(
+            payload={**base, "worker_run_id": "101-1-cycle-1",
+                     "auditor_run_id": "201:1:auditor"},
+            key_id=self.auditor_key.key_id,
+            private_key=type("FixtureSigner", (), {
+                "sign": lambda _self, message: self.auditor_test_keys.sign("witness", message),
+            })(),
+        )
+        self.control.record_cycle1_auditor_pass(
+            candidate=self.candidate, go=self.go, artifact=artifact,
+            verify_github_artifact=self._provenance, now=NOW,
+        )
+        self.control.claim_cycle(
+            candidate=self.candidate, go=self.go, cycle_number=2,
+            run_id="run-102:1:worker", source_commit_sha="c" * 40,
+            cycle1_auditor_artifact=artifact,
+            verify_github_artifact=self._provenance, now=NOW,
+        )
+        from test_github_worker_provenance import WorkerArtifactProvenanceTests, response
+        from unittest.mock import Mock
+        worker = WorkerArtifactProvenanceTests()
+        worker.setUp()
+        self.addCleanup(worker.doCleanups)
+        worker.manifest["worker_run_id"] = "101-1-cycle-1"
+        worker.run.update(id=101, run_attempt=1, head_sha="b" * 40)
+        worker.artifacts["artifacts"][0]["workflow_run"].update(id=101, head_sha="b" * 40)
+        historical_receipt = {
+            "repository_id": 1458303357, "cycle": 1, "run_id": "101-1-cycle-1",
+            "source_commit_sha": "b" * 40, "go_sha256": state1.go_sha256,
+            "journal_sequence": state1.sequence,
+            "journal_head_sha256": state1.head_sha256,
+            "journal_version": state1.version,
+        }
+        historical_claim = self.control.verify_historical_cycle1_claim(
+            candidate=self.candidate, go=self.go, receipt=historical_receipt,
+            manifest=worker.manifest, expected_run_id="101-1-cycle-1",
+            expected_execution_sha="b" * 40, github_read_token="test-only", now=NOW,
+            github_opener=Mock(side_effect=[response(worker.run), response(worker.artifacts)]),
+        )
+        before = self.backend.revision
+        previous = self.control.rehydrate_cycle1_stage_audit(
+            candidate=self.candidate, go=self.go,
+            verify_github_artifact=self._provenance, claim=historical_claim, now=NOW,
+        )
+        self.assertEqual(self.backend.revision, before)
+        self.assertEqual(previous.claim.run_id, "101-1-cycle-1")
+        self.assertEqual(previous.claim.source_commit_sha, "b" * 40)
+        self.assertEqual(previous.envelope_sha256,
+                         hashlib.sha256(canonical_json(artifact)).hexdigest())
+        self.assertTrue(is_verified_stage_audit(previous, previous.claim, None))
+
+        from f4_signing_provider import build_cycle1_stage_audit_verifier
+        verify_cycle1_stage = build_cycle1_stage_audit_verifier(
+            journal=self.control, reader=self._provenance,
+            candidate=self.candidate, go=self.go, now=NOW,
+        )
+        connected = verify_cycle1_stage(1, previous.claim, artifact, None)
+        self.assertTrue(is_verified_stage_audit(connected, previous.claim, None))
+        with self.assertRaisesRegex(Exception, "cycle1_audit_receipt_not_bound_to_cas"):
+            verify_cycle1_stage(1, previous.claim, {**artifact, "signature": "tampered"}, None)
+
+        def mismatched_provenance(payload):
+            return {**self._provenance(payload), "artifact_id": 9002}
+
+        with self.assertRaisesRegex(CycleControlHold, "cycle1_rehydrate_record_binding_mismatch"):
+            self.control.rehydrate_cycle1_stage_audit(
+                candidate=self.candidate, go=self.go,
+                verify_github_artifact=mismatched_provenance, claim=historical_claim, now=NOW,
+            )
+        with self.assertRaisesRegex(CycleControlHold, "github_artifact_provenance_verifier_missing"):
+            self.control.rehydrate_cycle1_stage_audit(
+                candidate=self.candidate, go=self.go,
+                verify_github_artifact=None, claim=historical_claim, now=NOW,
+            )
+        self.assertEqual(self.backend.revision, before)
+
     def test_tampered_artifact_and_missing_github_provenance_fail_closed(self) -> None:
         self.control.claim_cycle(
             candidate=self.candidate, go=self.go, cycle_number=1,

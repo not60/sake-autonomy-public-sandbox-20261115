@@ -5,11 +5,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import re
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from f4_signing_provider import (
     ROLE_ENVIRONMENTS, ROLE_REQUEST_FILES, ROLE_SECRET_NAMES,
     SigningCliHold, _require_independent_status_readers,
     build_live_go_execution_check,
+    build_live_delegation_status_reader,
     launch_signing_role_from_request_file, load_signing_request_file,
 )
 from f4_limited_delegation import build_delegation_payload
@@ -22,10 +23,10 @@ class SigningProviderContractTests(unittest.TestCase):
         """Exercise the real request-file -> trusted-context -> signer path offline."""
         import base64
         import hashlib
+        from attestations import canonical_json, sign_envelope
         from datetime import datetime, timedelta, timezone
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from attestations import canonical_json, sign_envelope
         from f4_limited_delegation import (
             build_delegation_payload, verify_delegation_contract,
             combine_candidate_authorization_fragments,
@@ -221,17 +222,31 @@ class SigningProviderContractTests(unittest.TestCase):
             self.assertEqual(witness["key_id"], role_keys["witness"].key_id)
             self.assertNotEqual(permit["key_id"], witness["key_id"])
 
-    def test_cycle2_reader_uses_existing_archive_verifier_and_returns_sealed_digest(self):
+    def test_finite_evidence_adapter_returns_sealed_cycle2_audit(self):
         import base64
         import hashlib
+        from attestations import canonical_json, sign_envelope
         from zipfile import ZipFile
-        from f4_auditor_artifact import create_cycle2_artifact
+        from f4_auditor_artifact import (
+            _worker_logical_run_id, create_cycle2_artifact_from_verified_inputs,
+        )
         from f4_cycle_control import (
             AUDIT_WORKFLOW_PATH, CYCLE2_AUDIT_ARTIFACT_NAME,
             GitHubArtifactProvenanceReader, build_cycle1_auditor_artifact,
         )
-        from f4_signing_provider import build_cycle2_audit_digest_reader
+        from f4_signing_provider import build_finite_execution_evidence_verifiers
         from test_f4_cycle_control import F4CycleControlTests, BASE_SHA, NOW
+        from test_f4_go_gate import EphemeralEd25519
+        from f4_cycle_control import is_verified_stage_audit
+        from trusted_key_registry import TrustedVerificationKey
+
+        self.assertEqual(_worker_logical_run_id(
+            {"worker_run_id": "102-1-cycle-2"}, "102", 2,
+        ), "102-1-cycle-2")
+        with self.assertRaisesRegex(ValueError, "worker_run_manifest_scope_invalid"):
+            _worker_logical_run_id({"worker_run_id": "101-1-cycle-2"}, "102", 2)
+        with self.assertRaisesRegex(ValueError, "worker_run_manifest_scope_invalid"):
+            _worker_logical_run_id({"worker_run_id": "102-1-cycle-1"}, "102", 2)
 
         fixture = F4CycleControlTests()
         fixture.setUp()
@@ -261,20 +276,11 @@ class SigningProviderContractTests(unittest.TestCase):
             candidate=fixture.candidate, go=fixture.go, artifact=cycle1_envelope,
             verify_github_artifact=fixture._provenance, now=NOW,
         )
-        cycle1_fields = (
-            "worker_run_id", "go_sha256", "pr_number", "pr_head_sha", "pr_base_sha",
-            "pr_state", "pr_is_draft", "pr_merged", "readonly_ci_run_id",
-            "readonly_ci_conclusion", "permit_id", "candidate_digest", "witness_digest",
-            "journal_revision", "journal_head_sha256",
-        )
-        previous = fixture.control.verify_stage_audit(
-            candidate=fixture.candidate, go=fixture.go, claim=claim1,
-            artifact=cycle1_envelope, previous=None,
-            verify_github_artifact=fixture._provenance,
-            read_verified_publication=lambda *_: {
-                key: cycle1_payload[key] for key in cycle1_fields
-            }, now=NOW,
-        )
+        from f4_signing_provider import build_cycle1_stage_audit_verifier
+        previous = build_cycle1_stage_audit_verifier(
+            journal=fixture.control, reader=fixture._provenance,
+            candidate=fixture.candidate, go=fixture.go, now=NOW,
+        )(1, claim1, cycle1_envelope, None)
 
         state2 = fixture.control.claim_cycle(
             candidate=fixture.candidate, go=fixture.go, cycle_number=2,
@@ -309,61 +315,214 @@ class SigningProviderContractTests(unittest.TestCase):
             signer = type("FixtureCycle2Signer", (), {
                 "sign": lambda _self, message: fixture.auditor_test_keys.sign("witness", message),
             })()
+            from test_github_worker_provenance import WorkerArtifactProvenanceTests, response
+            workers = []
+            api_responses = []
+            for numeric_id, logical_id in ((101, cycle1_run), (102, cycle2_run)):
+                worker = WorkerArtifactProvenanceTests()
+                worker.setUp()
+                self.addCleanup(worker.tearDown)
+                self.addCleanup(worker.doCleanups)
+                worker.manifest["worker_run_id"] = logical_id
+                worker.run.update(id=numeric_id, run_attempt=1, head_sha=cycle1_source)
+                worker.artifacts["artifacts"][0]["workflow_run"].update(
+                    id=numeric_id, head_sha=cycle1_source,
+                )
+                workers.append(worker)
+                api_responses.extend((response(worker.run), response(worker.artifacts)))
+            receipt1 = {
+                "repository_id": 1458303357, "cycle": 1, "run_id": cycle1_run,
+                "source_commit_sha": cycle1_source, "go_sha256": state1.go_sha256,
+                "journal_sequence": state1.sequence,
+                "journal_head_sha256": state1.head_sha256,
+                "journal_version": state1.version,
+            }
+            receipt2_worker = {
+                "repository_id": 1458303357, "cycle": 2, "run_id": cycle2_run,
+                "source_commit_sha": cycle2_source, "go_sha256": state2.go_sha256,
+                "journal_sequence": state2.sequence,
+                "journal_head_sha256": state2.head_sha256,
+                "journal_version": state2.version,
+            }
+            publication_evidence = {
+                **{key: value for key, value in publication.items() if key != "go_sha256"},
+                "schema": 1, "repository_id": 1458303357,
+                "base_sha": BASE_SHA,
+            }
             with patch("f4_auditor_artifact._SignerProxy", return_value=signer):
-                create_cycle2_artifact(
-                    claim=claim2, previous=previous,
-                    publication_reader=lambda *_: dict(publication), output=envelope_path,
-                    candidate=fixture.candidate, workspace=fixture.root,
+                create_cycle2_artifact_from_verified_inputs(
+                    journal=fixture.control, provenance_reader=fixture._provenance,
+                    candidate=fixture.candidate, go=fixture.go,
+                    cycle1_auditor_envelope=cycle1_envelope,
+                    cycle1_worker_receipt=receipt1,
+                    cycle1_worker_manifest=workers[0].manifest,
+                    cycle1_worker_run_id=cycle1_run,
+                    cycle1_execution_sha=cycle1_source,
+                    cycle2_worker_receipt=receipt2_worker,
+                    cycle2_worker_manifest=workers[1].manifest,
+                    cycle2_worker_run_id=cycle2_run,
+                    cycle2_execution_sha=cycle2_source,
+                    github_read_token="test-only",
+                    publication_evidence=publication_evidence,
+                    output=envelope_path,
+                    workspace=fixture.root,
                     expected_base_sha=BASE_SHA, trusted_keys=owner_keys,
                     auditor_key_document=auditor_key, revocation_envelope=fixture.revocation,
                     workflow_run_id="202", run_attempt=1,
-                    source_commit_sha=cycle2_source, now=NOW,
+                    github_opener=Mock(side_effect=api_responses), now=NOW,
                 )
             with ZipFile(archive_path, "w") as archive:
                 archive.write(envelope_path, "auditor-envelope.json")
             archive_bytes = archive_path.read_bytes()
             archive_digest = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
             reader = GitHubArtifactProvenanceReader(bearer_token="test-only")
+            stop_root = root / "stop-observer-test-keys"
+            stop_root.mkdir()
+            stop_keys = EphemeralEd25519(stop_root)
+            observer_key = TrustedVerificationKey(
+                "stop-observer-test-key", "stop_observer", stop_keys.public_keys["witness"],
+            )
+            stop_scope = {"executor": "isolated", "process_namespace": "worker",
+                          "continuation_namespace": "run"}
+            stop_signer = type("StopObserverFixtureSigner", (), {
+                "sign": lambda _self, message: stop_keys.sign("witness", message),
+            })()
+            stop_observations = []
+
+            def read_signed_observation(*, cycle, stage_receipt, audit):
+                stop_observations.append(cycle)
+                payload = {
+                    "schema": 1, "kind": "F4_SAFE_STOP", "repository_id": 1458303357,
+                    "cycle": cycle, "worker_run_id": audit.claim.run_id,
+                    "audit_run_id": audit.workflow_run_id,
+                    "audit_run_attempt": audit.run_attempt,
+                    "source_commit_sha": audit.claim.source_commit_sha,
+                    "go_sha256": audit.claim.go_sha256,
+                    "audit_sha256": audit.envelope_sha256,
+                    "observation_scope": stop_scope,
+                    "execution_terminated": True, "live_processes": [],
+                    "pending_executions": [],
+                    "observed_at": NOW.isoformat().replace("+00:00", "Z"),
+                }
+                return sign_envelope(
+                    key_id=observer_key.key_id, private_key=stop_signer, payload=payload,
+                )
+
+            verify_stage_result, verify_cycle_safe_stop = build_finite_execution_evidence_verifiers(
+                journal=fixture.control, reader=reader, candidate=fixture.candidate,
+                go=fixture.go,
+                publication_reader=lambda *_: {
+                    key: publication[key] for key in (
+                        "worker_run_id", "go_sha256", "pr_number", "pr_head_sha",
+                        "pr_base_sha", "pr_state", "pr_is_draft", "pr_merged",
+                        "readonly_ci_run_id", "readonly_ci_conclusion", "permit_id",
+                        "candidate_digest", "witness_digest", "journal_revision",
+                        "journal_head_sha256", "permit_sha256",
+                    )
+                },
+                observer_key=observer_key, expected_stop_scope=stop_scope,
+                trusted_signing_keys=fixture.owner_keys,
+                read_signed_observation=read_signed_observation, now=NOW,
+            )
+            def verify_test_signature(public_key, signature, message):
+                if public_key == observer_key.public_key:
+                    return stop_keys.verify(public_key, signature, message)
+                return fixture.keys.verify(public_key, signature, message)
 
             def github_fixture(path):
                 if path.endswith("/artifacts"):
+                    if "/runs/201/" in path:
+                        return {"artifacts": [{
+                            "id": 9001, "name": "b09-f4-cycle1-auditor-evidence",
+                            "expired": False, "workflow_run": {"id": 201},
+                            "digest": "sha256:" + "f" * 64,
+                        }]}
                     return {"artifacts": [{
                         "id": 9002, "name": CYCLE2_AUDIT_ARTIFACT_NAME,
                         "expired": False, "workflow_run": {"id": 202},
                         "digest": archive_digest,
                     }]}
+                run_id = 201 if "/runs/201" in path else 202
                 return {
-                    "id": 202, "run_attempt": 1, "path": AUDIT_WORKFLOW_PATH,
-                    "head_sha": cycle2_source, "status": "completed",
+                    "id": run_id, "run_attempt": 1, "path": AUDIT_WORKFLOW_PATH,
+                    "head_sha": cycle1_source if run_id == 201 else cycle2_source,
+                    "status": "completed",
                     "conclusion": "success", "repository": {"id": 1458303357},
                 }
 
             with patch.object(reader, "_get_json", side_effect=github_fixture), \
-                 patch("f4_cycle_control._now", return_value=NOW):
-                read = build_cycle2_audit_digest_reader(
-                    journal=fixture.control, reader=reader, archive_path=archive_path,
-                    run_id="202", attempt=1, candidate=fixture.candidate, go=fixture.go,
-                    claim=claim2, previous=previous,
-                    publication_reader=lambda *_: {
-                        key: publication[key] for key in (
-                            "worker_run_id", "go_sha256", "pr_number", "pr_head_sha",
-                            "pr_base_sha", "pr_state", "pr_is_draft", "pr_merged",
-                            "readonly_ci_run_id", "readonly_ci_conclusion", "permit_id",
-                            "candidate_digest", "witness_digest", "journal_revision",
-                            "journal_head_sha256", "permit_sha256",
-                        )
-                    },
-                )
-                self.assertRegex(read(), r"^[a-f0-9]{64}$")
-                tampered = root / "tampered.zip"
-                tampered.write_bytes(archive_bytes + b"x")
-                with self.assertRaisesRegex(SigningCliHold, "cycle2_audit_verification_failed"):
-                    build_cycle2_audit_digest_reader(
-                        journal=fixture.control, reader=reader, archive_path=tampered,
-                        run_id="202", attempt=1, candidate=fixture.candidate, go=fixture.go,
-                        claim=claim2, previous=previous,
-                        publication_reader=lambda *_: publication,
+                 patch("f4_cycle_control._now", return_value=NOW), \
+                 patch("f4_cycle_control._verify_ed25519", side_effect=verify_test_signature):
+                receipt2 = {"archive": archive_bytes, "workflow_run_id": "202", "run_attempt": 1}
+                audit_results = []
+                stage_failures = []
+
+                def integrated_stage_verifier(cycle, claim, receipt, prior):
+                    try:
+                        result = verify_stage_result(cycle, claim, receipt, prior)
+                    except Exception as error:
+                        stage_failures.append(f"{type(error).__name__}: {error}")
+                        raise
+                    audit_results.append(result)
+                    return result
+
+                def execute_stage(cycle, stage):
+                    if stage == "worker":
+                        return {"cycle": cycle, "run_id": claim1.run_id if cycle == 1 else claim2.run_id}
+                    return cycle1_envelope if cycle == 1 else receipt2
+
+                def verify_worker_result(cycle, _receipt):
+                    return claim1 if cycle == 1 else claim2
+
+                stop_failures = []
+
+                def diagnostic_stop_verifier(cycle, receipt, audit):
+                    try:
+                        return verify_cycle_safe_stop(cycle, receipt, audit)
+                    except Exception as error:
+                        stop_failures.append(f"{type(error).__name__}: {error}")
+                        raise
+
+                from f4_limited_delegation import execute_finite_two_cycles
+                try:
+                    result = execute_finite_two_cycles(
+                        check_revocation=lambda _cycle: True,
+                        verify_worker_result=verify_worker_result,
+                        verify_stage_result=integrated_stage_verifier,
+                        verify_cycle_safe_stop=diagnostic_stop_verifier,
+                        execute_stage=execute_stage,
+                        verify_cycle1_audit=lambda receipt: receipt == cycle1_envelope,
+                        safe_stop=lambda: True,
                     )
+                except Exception:
+                    self.fail(f"finite audit pipeline rejected fixture: {stage_failures}; stops={stop_failures}")
+                self.assertEqual(result.cycles_completed, 2)
+                self.assertEqual(stop_observations, [1, 2])
+                self.assertEqual(len(audit_results), 2)
+                audit2 = audit_results[1]
+                self.assertTrue(is_verified_stage_audit(audit2, claim2, previous))
+                with self.assertRaisesRegex(SigningCliHold, "cycle2_stage_verification_failed_no_retry"):
+                    # Malformed archive evidence is rejected by the same existing provenance verifier.
+                    verify_stage_result(
+                        2, claim2,
+                        {"archive": archive_bytes + b"x", "workflow_run_id": "202",
+                         "run_attempt": 1},
+                        previous,
+                    )
+                with self.assertRaisesRegex(SigningCliHold, "cycle2_stage_receipt_scope_invalid"):
+                    verify_stage_result(2, claim2, {"archive": archive_bytes}, previous)
+
+            with self.assertRaisesRegex(SigningCliHold, "safe_stop_observation_reader_missing"):
+                build_finite_execution_evidence_verifiers(
+                    journal=fixture.control, reader=reader, candidate=fixture.candidate,
+                    go=fixture.go, cycle1_stage_verifier=lambda *_: previous,
+                    publication_reader=lambda *_: publication,
+                    observer_key=observer_key,
+                    expected_stop_scope={"executor": "isolated", "process_namespace": "worker",
+                                         "continuation_namespace": "run"},
+                    trusted_signing_keys=fixture.owner_keys,
+                    read_signed_observation=None, now=NOW,
+                )
 
     def test_four_stopped_jobs_use_one_environment_and_only_their_own_secret(self):
         text = (ROOT / "f4-signing-jobs.draft.yml").read_text()
@@ -519,6 +678,92 @@ class SigningProviderContractTests(unittest.TestCase):
             reader = build.call_args.kwargs["read_signed_revocation"]
             with self.assertRaisesRegex(SigningCliHold, "state_missing"):
                 reader()
+
+    def test_live_delegation_reader_uses_pinned_project_and_read_role_only(self):
+        import hashlib
+        from datetime import datetime, timedelta, timezone
+        from attestations import canonical_json
+        from trusted_key_registry import TrustedVerificationKey
+
+        now = datetime.now(timezone.utc)
+        stamp = lambda value: value.isoformat().replace("+00:00", "Z")
+        contract = {
+            "delegation_id": "live-reader-contract-fixture",
+            "repository_id": 1458303357,
+            "execution_revision": "a" * 40,
+            "revocation": {"sequence": 1},
+        }
+        payload = {
+            "schema": 1, "kind": "DELEGATION_REVOCATION_STATUS",
+            "delegation_id": contract["delegation_id"],
+            "contract_sha256": hashlib.sha256(canonical_json(contract)).hexdigest(),
+            "repository_id": 1458303357,
+            "execution_revision": contract["execution_revision"],
+            "environment": "formal", "sequence": 1, "status": "ACTIVE",
+            "issued_at": stamp(now - timedelta(seconds=2)),
+            "expires_at": stamp(now + timedelta(minutes=2)),
+        }
+        envelope = {
+            "payload": payload,
+            "approvals": {
+                role: {"key_id": role, "signature": "YQ=="}
+                for role in ("owner_a", "owner_b")
+            },
+        }
+        document = {
+            "schema": 1, "environment": "formal", "status": envelope,
+            "head_sha256": hashlib.sha256(canonical_json(envelope)).hexdigest(),
+        }
+        response_body = canonical_json(document)
+        observed = []
+
+        class Response:
+            headers = {"ETag": '"1"'}
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return response_body
+
+        def opener(request, timeout):
+            observed.append((request, timeout))
+            return Response()
+
+        keys = {
+            role: TrustedVerificationKey(role, role, bytes([index]) * 32)
+            for index, role in enumerate(("owner_a", "owner_b"), 1)
+        }
+        env = {
+            "B09_F4_CONTROL_V2_READ_BEARER": "formal-read-fixture-token",
+            "B09_F4_CONTROL_V2_OWNER_BEARER": "must-not-be-selected",
+        }
+        with patch("cas_journal.urlopen", side_effect=opener), \
+                patch("delegation_revocation._verify_ed25519", return_value=None):
+            reader = build_live_delegation_status_reader(
+                env=env, trusted_owner_keys=keys, environment="formal",
+                delegation_payload=contract, timeout=1.25,
+            )
+            self.assertEqual(reader(contract), {
+                "delegation_id": contract["delegation_id"],
+                "sequence": 1, "status": "ACTIVE",
+            })
+        self.assertEqual(len(observed), 1)
+        request, timeout = observed[0]
+        self.assertEqual(request.full_url,
+            "https://bkpofcpaefkocykvtsjv.supabase.co/functions/v1/sake-cas-v1/"
+            "repositories/1458303357/b09-delegation-status-v1.json")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_header("Authorization"), "Bearer formal-read-fixture-token")
+        self.assertEqual(request.get_header("X-b09-cas-auth-generation"), "v2")
+        self.assertEqual(timeout, 1.25)
+        with self.assertRaisesRegex(SigningCliHold, "reader_context_invalid"):
+            build_live_delegation_status_reader(
+                env=env, trusted_owner_keys=keys, environment="unknown",
+                delegation_payload=contract,
+            )
+        with self.assertRaisesRegex(SigningCliHold, "read_credential_missing"):
+            build_live_delegation_status_reader(
+                env={}, trusted_owner_keys=keys, environment="formal",
+                delegation_payload=contract,
+            )
 
     def test_delegation_allowlist_cannot_authorize_signer_or_job_source_changes(self):
         for path in ("f4_signing_cli.py", "f4_signing_provider.py", "f4-signing-jobs.draft.yml"):

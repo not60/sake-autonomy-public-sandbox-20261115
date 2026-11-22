@@ -472,6 +472,60 @@ def build_delegation_status_reader(*, backend, trusted_owner_keys, environment, 
     )
 
 
+_DELEGATION_STATUS_ENDPOINT = (
+    "https://bkpofcpaefkocykvtsjv.supabase.co/functions/v1/sake-cas-v1"
+)
+_DELEGATION_READ_TOKEN_ENV = {
+    "formal": "B09_F4_CONTROL_V2_READ_BEARER",
+    "test": "B09_F4_CONTROL_V2_TEST_READ_BEARER",
+}
+
+
+class _ReadOnlyCasBackend:
+    """Expose only the authenticated GET operation to the status reader."""
+
+    def __init__(self, backend):
+        if not callable(getattr(backend, "read", None)):
+            raise SigningCliHold("delegation_status_read_backend_missing")
+        self._backend = backend
+
+    def read(self, key):
+        return self._backend.read(key)
+
+
+def build_live_delegation_status_reader(*, env, trusted_owner_keys,
+                                        environment, delegation_payload,
+                                        timeout=5.0):
+    """Bind the existing verifier to this project's fixed HTTPS CAS GET route.
+
+    The protected caller supplies its environment mapping. Only the matching
+    formal or TEST read Bearer is accepted; no endpoint override or write API is
+    exposed to the returned callback. Secret values are never logged or returned.
+    """
+    if environment not in _DELEGATION_READ_TOKEN_ENV or not isinstance(env, Mapping):
+        raise SigningCliHold("delegation_status_reader_context_invalid")
+    token = env.get(_DELEGATION_READ_TOKEN_ENV[environment])
+    if not isinstance(token, str) or not token:
+        raise SigningCliHold("delegation_status_read_credential_missing")
+    try:
+        from cas_journal import HttpsCasBackend
+        backend = HttpsCasBackend(
+            endpoint=_DELEGATION_STATUS_ENDPOINT,
+            bearer_token=token,
+            timeout=timeout,
+        )
+        return build_delegation_status_reader(
+            backend=_ReadOnlyCasBackend(backend),
+            trusted_owner_keys=trusted_owner_keys,
+            environment=environment,
+            delegation_payload=delegation_payload,
+        )
+    except SigningCliHold:
+        raise
+    except Exception:
+        raise SigningCliHold("delegation_status_reader_unavailable") from None
+
+
 def build_cycle2_audit_digest_reader(*, journal, reader, archive_path, run_id, attempt,
                                     candidate, go, claim, previous, publication_reader):
     """Return the Cycle2 digest only after the existing archive/provenance verifier seals it."""
@@ -494,3 +548,127 @@ def build_cycle2_audit_digest_reader(*, journal, reader, archive_path, run_id, a
     if not is_verified_stage_audit(result, claim, previous):
         raise SigningCliHold("cycle2_audit_not_independently_verified")
     return lambda: result.envelope_sha256
+
+
+def build_cycle1_stage_audit_verifier(*, journal, reader, candidate, go, now=None):
+    """Rehydrate Cycle 1's sealed audit from its CAS record for a later finite stage.
+
+    The receipt is the original signed envelope handed off by the Cycle 1 stage;
+    its digest must match the envelope recorded in the hash-chained CAS event.
+    GitHub provenance is re-read by the existing trusted artifact reader.
+    """
+    from attestations import canonical_json
+    from f4_cycle_control import CycleControlHold, is_verified_stage_audit
+    import hashlib
+
+    if not callable(getattr(journal, "rehydrate_cycle1_stage_audit", None)):
+        raise SigningCliHold("cycle1_audit_cas_reader_missing")
+    if not callable(reader):
+        raise SigningCliHold("cycle1_audit_provenance_reader_missing")
+
+    def verify(cycle, claim, receipt, previous):
+        if (type(cycle) is not int or cycle != 1 or previous is not None
+                or getattr(claim, "cycle", None) != 1
+                or not isinstance(receipt, dict)):
+            raise SigningCliHold("cycle1_audit_receipt_scope_invalid")
+        try:
+            audit = journal.rehydrate_cycle1_stage_audit(
+                candidate=candidate, go=go, verify_github_artifact=reader,
+                claim=claim, now=now,
+            )
+        except Exception:
+            raise SigningCliHold("cycle1_audit_cas_rehydration_failed") from None
+        if (not is_verified_stage_audit(audit, audit.claim, None)
+                or (audit.claim.cycle, audit.claim.run_id, audit.claim.go_sha256,
+                    audit.claim.source_commit_sha)
+                   != (claim.cycle, claim.run_id, claim.go_sha256, claim.source_commit_sha)
+                or hashlib.sha256(canonical_json(receipt)).hexdigest() != audit.envelope_sha256):
+            raise SigningCliHold("cycle1_audit_receipt_not_bound_to_cas")
+        return audit
+
+    return verify
+
+
+def build_finite_execution_evidence_verifiers(*, journal, reader, candidate, go,
+                                               cycle1_stage_verifier=None,
+                                               publication_reader, observer_key,
+                                               expected_stop_scope,
+                                               trusted_signing_keys,
+                                               read_signed_observation, now=None):
+    """Bind signed Cycle2 evidence and independent stop observations to F4's finite runner.
+
+    The publish-audit receipt for Cycle2 is data only and must have exactly
+    ``archive``, ``workflow_run_id`` and ``run_attempt``. The existing GitHub
+    artifact provenance reader and cycle journal verify its contents and source.
+    If no Cycle1 verifier is injected, the journal's recorded signed audit is
+    rehydrated read-only and matched to the exact Cycle1 envelope receipt. The
+    returned stop callback remains the signed-observer verifier; this helper
+    starts no work or network calls and missing real readers fail closed.
+    """
+    from f4_cycle_control import (
+        build_cycle_safe_stop_verifier, is_verified_stage_audit,
+    )
+
+    if cycle1_stage_verifier is None:
+        cycle1_stage_verifier = build_cycle1_stage_audit_verifier(
+            journal=journal, reader=reader, candidate=candidate, go=go, now=now,
+        )
+    if not callable(cycle1_stage_verifier):
+        raise SigningCliHold("cycle1_stage_verifier_missing")
+    if not callable(publication_reader):
+        raise SigningCliHold("cycle2_publication_reader_missing")
+    if not callable(read_signed_observation):
+        raise SigningCliHold("safe_stop_observation_reader_missing")
+    try:
+        verify_cycle_safe_stop = build_cycle_safe_stop_verifier(
+            observer_key=observer_key,
+            expected_scope=expected_stop_scope,
+            trusted_signing_keys=trusted_signing_keys,
+            read_signed_observation=read_signed_observation,
+            now=now,
+        )
+    except Exception:
+        raise SigningCliHold("safe_stop_verifier_unavailable") from None
+
+    def verify_stage_result(cycle, claim, receipt, previous):
+        if type(cycle) is not int or cycle not in (1, 2):
+            raise SigningCliHold("finite_stage_cycle_invalid")
+        if cycle == 1:
+            if previous is not None:
+                raise SigningCliHold("cycle1_previous_audit_unexpected")
+            try:
+                result = cycle1_stage_verifier(cycle, claim, receipt, previous)
+            except Exception:
+                raise SigningCliHold("cycle1_stage_verification_failed") from None
+            if not is_verified_stage_audit(result, claim, None):
+                raise SigningCliHold("cycle1_stage_audit_unsealed")
+            return result
+
+        if (getattr(claim, "cycle", None) != 2
+                or not is_verified_stage_audit(previous, getattr(previous, "claim", None), None)
+                or previous.claim.cycle != 1
+                or type(receipt) is not dict
+                or set(receipt) != {"archive", "workflow_run_id", "run_attempt"}):
+            raise SigningCliHold("cycle2_stage_receipt_scope_invalid")
+        archive = receipt.get("archive")
+        run_id = receipt.get("workflow_run_id")
+        attempt = receipt.get("run_attempt")
+        if (not isinstance(archive, bytes) or not 0 < len(archive) <= 2 * 1024 * 1024
+                or not isinstance(run_id, str) or not run_id.isascii()
+                or not run_id.isdecimal()
+                or run_id.startswith("0") or type(attempt) is not int or attempt < 1):
+            raise SigningCliHold("cycle2_stage_receipt_scope_invalid")
+        try:
+            from f4_auditor_artifact import verify_cycle2_archive
+            result = verify_cycle2_archive(
+                journal=journal, reader=reader, archive=archive, run_id=run_id,
+                attempt=attempt, candidate=candidate, go=go, claim=claim,
+                previous=previous, publication_reader=publication_reader, now=now,
+            )
+        except Exception:
+            raise SigningCliHold("cycle2_stage_verification_failed_no_retry") from None
+        if not is_verified_stage_audit(result, claim, previous):
+            raise SigningCliHold("cycle2_stage_audit_unsealed")
+        return result
+
+    return verify_stage_result, verify_cycle_safe_stop

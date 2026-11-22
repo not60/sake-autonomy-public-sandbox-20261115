@@ -19,6 +19,10 @@ on:
         description: Required source run ID for the Cycle 1 Auditor evidence on Cycle 2
         required: false
         type: string
+      cycle1_worker_run_id:
+        description: Required source run ID for the Cycle 1 Worker artifacts on Cycle 2
+        required: false
+        type: string
       f4_go_approval_run_id:
         description: Run ID containing the externally signed F4 GO approval bundle
         required: false
@@ -509,6 +513,42 @@ jobs:
           repository: not60/sake-autonomy-public-sandbox-20261115
           run-id: ${{ inputs.worker_run_id }}
           github-token: ${{ github.token }}
+      - name: Require and download Cycle 1 Worker and Auditor handoffs for Cycle 2
+        if: ${{ inputs.f4_cycle == '2' }}
+        env:
+          CYCLE1_WORKER_RUN_ID: ${{ inputs.cycle1_worker_run_id }}
+          CYCLE1_AUDITOR_RUN_ID: ${{ inputs.cycle1_auditor_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "${CYCLE1_WORKER_RUN_ID:-}" =~ ^[1-9][0-9]*$ ]] || { echo 'HOLD: Cycle 1 Worker run ID missing or invalid.' >&2; exit 78; }
+          [[ "${CYCLE1_AUDITOR_RUN_ID:-}" =~ ^[1-9][0-9]*$ ]] || { echo 'HOLD: Cycle 1 Auditor run ID missing or invalid.' >&2; exit 78; }
+      - name: Download Cycle 1 Worker artifact for Cycle 2 audit
+        if: ${{ inputs.f4_cycle == '2' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-public-runner-candidate
+          path: ${{ runner.temp }}/b09-f4-cycle1-bundle
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.cycle1_worker_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download Cycle 1 Worker claim receipt for Cycle 2 audit
+        if: ${{ inputs.f4_cycle == '2' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-worker-claim-receipt
+          path: ${{ runner.temp }}/b09-f4-cycle1-claim
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.cycle1_worker_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download Cycle 1 Auditor envelope for Cycle 2 audit
+        if: ${{ inputs.f4_cycle == '2' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: b09-f4-cycle1-auditor-evidence
+          path: ${{ runner.temp }}/b09-f4-cycle1-auditor-evidence
+          repository: not60/sake-autonomy-public-sandbox-20261115
+          run-id: ${{ inputs.cycle1_auditor_run_id }}
+          github-token: ${{ github.token }}
       - name: Independently verify completed Worker run and artifact provenance
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -540,6 +580,7 @@ jobs:
           B09_PR_NUMBER: ${{ needs.publisher.outputs.pr_number }}
           B09_PR_HEAD_SHA: ${{ needs.publisher.outputs.pr_head_sha }}
           B09_PR_BASE_SHA: ${{ needs.publisher.outputs.pr_base_sha }}
+          F4_CYCLE: ${{ inputs.f4_cycle }}
         run: |
           set -euo pipefail
           test -s "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" || { echo 'HOLD: externally managed signing keys missing.' >&2; exit 78; }
@@ -584,6 +625,7 @@ jobs:
             --expected-pr-head-sha "$B09_PR_HEAD_SHA" \
             --expected-pr-base-sha "$B09_PR_BASE_SHA" \
             --f4-audit-evidence-output "$RUNNER_TEMP/f4-audit-evidence.json" \
+            --f4-cycle "$F4_CYCLE" \
             "${args[@]}"
       - name: Sign Cycle 1 Auditor evidence with its independent key
         if: ${{ inputs.f4_cycle == '1' }}
@@ -637,11 +679,52 @@ jobs:
             --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
             --auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
             --auditor-artifact "$RUNNER_TEMP/b09-f4-cycle1-auditor-evidence/auditor-envelope.json"
-      - name: End Cycle 2 in SAFE STOP
+      - name: Sign Cycle 2 Auditor evidence from verified cross-run inputs
         if: ${{ inputs.f4_cycle == '2' }}
         env:
-          F4_CYCLE: ${{ inputs.f4_cycle }}
+          B09_F4_AUDITOR_PRIVATE_KEY_PKCS8_B64: ${{ secrets.B09_F4_AUDITOR_PRIVATE_KEY_PKCS8_B64 }}
+          F4_BASE_SHA: ${{ inputs.f4_base_sha }}
+          WORKER_RUN_ID: ${{ inputs.worker_run_id }}
+          CYCLE1_WORKER_RUN_ID: ${{ inputs.cycle1_worker_run_id }}
         run: |
           set -euo pipefail
-          test "$F4_CYCLE" = '2'
-          echo 'F4_CYCLE2_AUDITOR_COMPLETE_SAFE_STOP'
+          python ops/command-tower/f4_auditor_artifact.py \
+            --cycle 2 \
+            --evidence "$RUNNER_TEMP/f4-audit-evidence.json" \
+            --candidate "$RUNNER_TEMP/b09-f4-go/candidate.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --expected-base-sha "$F4_BASE_SHA" \
+            --trusted-keys "$RUNNER_TEMP/b09-f4-trust/trusted-keys.json" \
+            --auditor-key "$RUNNER_TEMP/b09-f4-trust/auditor-key.json" \
+            --revocation "$RUNNER_TEMP/b09-f4-go/revocation-envelope.json" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-commit-sha "$GITHUB_SHA" \
+            --worker-run-id "$WORKER_RUN_ID" \
+            --worker-manifest "$RUNNER_TEMP/b09-bundle/manifest.json" \
+            --claim-receipt "$RUNNER_TEMP/b09-f4-claim/f4-worker-claim-receipt.json" \
+            --cycle1-auditor-artifact "$RUNNER_TEMP/b09-f4-cycle1-auditor-evidence/auditor-envelope.json" \
+            --cycle1-worker-run-id "$CYCLE1_WORKER_RUN_ID" \
+            --cycle1-worker-manifest "$RUNNER_TEMP/b09-f4-cycle1-bundle/manifest.json" \
+            --cycle1-claim-receipt "$RUNNER_TEMP/b09-f4-cycle1-claim/f4-worker-claim-receipt.json" \
+            --output "$RUNNER_TEMP/b09-f4-cycle2-auditor-envelope.json"
+      - name: Require and upload Cycle 2 signed Auditor handoff
+        if: ${{ inputs.f4_cycle == '2' }}
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/b09-f4-cycle2-auditor-envelope.json" || { echo 'HOLD: signed Cycle 2 Auditor envelope missing.' >&2; exit 78; }
+          mkdir -p "$RUNNER_TEMP/b09-f4-cycle2-auditor-evidence"
+          install -m 600 "$RUNNER_TEMP/b09-f4-cycle2-auditor-envelope.json" "$RUNNER_TEMP/b09-f4-cycle2-auditor-evidence/auditor-envelope.json"
+      - name: Upload signed Cycle 2 Auditor handoff
+        if: ${{ inputs.f4_cycle == '2' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: b09-f4-cycle2-auditor-evidence
+          path: ${{ runner.temp }}/b09-f4-cycle2-auditor-evidence/auditor-envelope.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Keep finite-cycle completion on HOLD pending independent SAFE STOP
+        if: ${{ inputs.f4_cycle == '2' }}
+        run: |
+          set -euo pipefail
+          echo 'Cycle 2 Auditor artifact emitted. This run does not complete F4; the finite controller still requires independently signed SAFE STOP evidence.' >> "$GITHUB_STEP_SUMMARY"

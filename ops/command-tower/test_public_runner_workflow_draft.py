@@ -49,6 +49,7 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         self.assertIn("execution_stage:", source)
         self.assertIn("options: ['worker', 'publish-audit']", source)
         self.assertIn("worker_run_id:", source)
+        self.assertIn("cycle1_worker_run_id:", source)
         self.assertNotRegex(source, r"(?m)^  workflow_run:")
         self.assertNotRegex(source, r"(?m)^  push:")
         self.assertIn("if: ${{ false && github.ref == 'refs/heads/trusted/f4-nonprod-20261119' && inputs.execution_stage == 'worker' }}", source)
@@ -62,7 +63,18 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         self.assertIn("run-id: ${{ inputs.publisher_attestation_run_id }}", publisher)
         self.assertIn("run-id: ${{ inputs.worker_run_id }}", auditor)
         self.assertIn("needs: [publisher]", auditor)
-        self.assertIn("F4_CYCLE2_AUDITOR_COMPLETE_SAFE_STOP", auditor)
+        self.assertIn("name: Sign Cycle 2 Auditor evidence from verified cross-run inputs", auditor)
+        self.assertIn("--cycle1-worker-manifest", auditor)
+        self.assertIn("--cycle1-claim-receipt", auditor)
+        self.assertIn("name: Upload signed Cycle 2 Auditor handoff", auditor)
+        self.assertIn("name: b09-f4-cycle2-auditor-evidence", auditor)
+        cycle2_end = auditor.split(
+            "      - name: Keep finite-cycle completion on HOLD pending independent SAFE STOP\n",
+            1,
+        )[1]
+        self.assertIn("This run does not complete F4", cycle2_end)
+        self.assertIn("independently signed SAFE STOP evidence", cycle2_end)
+        self.assertNotIn("F4_CYCLE2_AUDITOR_COMPLETE_SAFE_STOP", auditor)
 
     def test_worker_packages_actual_delta_and_binds_codex_output(self) -> None:
         source = DRAFT_WORKFLOW.read_text(encoding="utf-8")
@@ -104,7 +116,8 @@ class PublicRunnerWorkflowDraftTests(unittest.TestCase):
         self.assertLess(publisher.index('--f4-claim-receipt '), publisher.index('--draft-pr-write '))
         self.assertIn('--source-commit-sha "$EXPECTED_EXECUTION_SHA"', auditor)
         self.assertIn('--cycle "$F4_CYCLE"', auditor)
-        self.assertIn("test \"$F4_CYCLE\" = '2'", source)
+        self.assertIn("--cycle \"$F4_CYCLE\"", auditor)
+        self.assertIn("--f4-cycle \"$F4_CYCLE\"", publisher)
 
     def test_publisher_writer_is_connected_but_remains_hard_disabled(self) -> None:
         source = DRAFT_WORKFLOW.read_text(encoding="utf-8")

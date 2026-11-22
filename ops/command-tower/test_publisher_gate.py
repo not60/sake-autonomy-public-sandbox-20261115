@@ -10,7 +10,8 @@ import unittest
 from cas_journal import PermitCasJournal
 from durable_store import DurableStore
 from publisher_gate import (
-    OfflineVerificationResult, PublisherGate, PublisherGateHold, prepare_draft_pr_plan,
+    OfflineVerificationResult, PublisherGate, PublisherGateHold, _cycle_audit_evidence,
+    prepare_draft_pr_plan,
 )
 from test_cas_journal import MemoryCasBackend
 
@@ -182,6 +183,23 @@ class PublisherGateTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PublisherGateHold, "draft_pr_approval_or_verification_missing"):
             prepare_draft_pr_plan(result)
+
+    def test_f4_publication_evidence_keeps_cycle_specific_permit_digest(self) -> None:
+        base = {"worker_run_id": "101-1-cycle-1", "permit_sha256": "a" * 64}
+        cycle1 = _cycle_audit_evidence(
+            base, cycle=1, repository_id=REPOSITORY_ID, base_sha=BASE_SHA,
+        )
+        self.assertNotIn("permit_sha256", cycle1)
+        cycle2 = _cycle_audit_evidence(
+            {**base, "worker_run_id": "102-1-cycle-2"}, cycle=2,
+            repository_id=REPOSITORY_ID, base_sha=BASE_SHA,
+        )
+        self.assertEqual(cycle2["permit_sha256"], "a" * 64)
+        with self.assertRaisesRegex(PublisherGateHold, "cycle2_permit_digest_missing"):
+            _cycle_audit_evidence(
+                {"worker_run_id": "102-1-cycle-2"}, cycle=2,
+                repository_id=REPOSITORY_ID, base_sha=BASE_SHA,
+            )
 
 
 if __name__ == "__main__":

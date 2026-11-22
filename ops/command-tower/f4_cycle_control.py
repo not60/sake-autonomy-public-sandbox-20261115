@@ -415,6 +415,78 @@ class F4CycleControlJournal:
             state.go_sha256, state.sequence, state.head_sha256,
             _sha256(canonical_json(proof)), _CLAIM_RECEIPT_SEAL)
 
+    def verify_historical_cycle1_claim(self, *, candidate, go, receipt, manifest,
+                                       expected_run_id, expected_execution_sha,
+                                       github_read_token, now=None, github_opener=None):
+        """Re-verify Cycle 1 provenance against its immutable claim event after Cycle 2.
+
+        The journal event, not the historical CAS ETag, is authoritative for the
+        old claim. The receipt's original version is required as a schema field but
+        cannot be compared with the current CAS version after later appends.
+        """
+        from github_worker_provenance import verify_worker_artifact_provenance
+
+        state, _stored = self._load_for_go(candidate, go)
+        instant = _now(now)
+        status = _verify_revocation_status(
+            _current_revocation(state.events), go=go, go_sha256=state.go_sha256,
+            trusted_keys=self._owner_keys, now=instant,
+        )
+        if status["status"] != "ACTIVE" or not go.not_before <= instant < go.expires_at:
+            raise CycleControlHold("historical_claim_go_inactive")
+        if (not isinstance(expected_run_id, str)
+                or re.fullmatch(r"([1-9][0-9]*)-([1-9][0-9]*)-cycle-1", expected_run_id) is None
+                or not isinstance(expected_execution_sha, str)
+                or not _GIT_SHA.fullmatch(expected_execution_sha)):
+            raise CycleControlHold("historical_claim_expected_identity_invalid")
+
+        claims, audits = _cycle_history(state.events)
+        if (len(claims) not in (1, 2) or not audits
+                or claims[0].get("cycle_number") != 1
+                or claims[0].get("run_id") != expected_run_id
+                or claims[0].get("source_commit_sha") != expected_execution_sha
+                or claims[0].get("go_sha256") != state.go_sha256):
+            raise CycleControlHold("historical_claim_journal_binding_mismatch")
+        event = next((item for item in state.events
+                      if item["payload"].get("event") == "CYCLE_CLAIMED"
+                      and item["payload"].get("cycle_number") == 1), None)
+        if event is None:
+            raise CycleControlHold("historical_claim_event_missing")
+        expected = {
+            "repository_id": REPOSITORY_ID, "cycle": 1,
+            "run_id": expected_run_id,
+            "source_commit_sha": expected_execution_sha,
+            "go_sha256": state.go_sha256,
+            "journal_sequence": event["sequence"],
+            "journal_head_sha256": event["event_sha256"],
+        }
+        if (not isinstance(receipt, Mapping)
+                or set(receipt) != {*expected, "journal_version"}
+                or any(receipt.get(key) != value for key, value in expected.items())
+                or not isinstance(receipt.get("journal_version"), str)
+                or not receipt["journal_version"]):
+            raise CycleControlHold("historical_claim_receipt_mismatch")
+
+        identity = re.fullmatch(r"([1-9][0-9]*)-([1-9][0-9]*)-cycle-1", expected_run_id)
+        kwargs = {} if github_opener is None else {"opener": github_opener}
+        try:
+            proof = verify_worker_artifact_provenance(
+                manifest, expected_run_id=identity.group(1),
+                expected_base_sha=go.base_sha,
+                expected_execution_sha=expected_execution_sha, expected_cycle=1,
+                bearer_token=github_read_token, **kwargs,
+            )
+        except Exception:
+            raise CycleControlHold("historical_worker_provenance_unverified") from None
+        return VerifiedWorkerClaim(
+            cycle=1, run_id=expected_run_id,
+            source_commit_sha=expected_execution_sha, go_sha256=state.go_sha256,
+            journal_sequence=event["sequence"],
+            journal_head_sha256=event["event_sha256"],
+            worker_provenance_sha256=_sha256(canonical_json(proof)),
+            _seal=_CLAIM_RECEIPT_SEAL,
+        )
+
     def verify_stage_audit(self, *, candidate, go, claim, artifact, previous,
                            verify_github_artifact, read_verified_publication, now=None):
         """Bind the signed audit to the CAS claim and independently read publication evidence.
@@ -516,6 +588,82 @@ class F4CycleControlJournal:
             "auditor_envelope": artifact,
         }
         return self._append(state, current, event)
+
+    def rehydrate_cycle1_stage_audit(self, *, candidate: object, go: VerifiedF4Go,
+                                     verify_github_artifact: Callable[[Mapping[str, object]], object] | None,
+                                     claim: VerifiedWorkerClaim,
+                                     now: datetime | None = None) -> VerifiedStageAudit:
+        """Rebuild the sealed Cycle 1 audit only from the authenticated CAS record.
+
+        This supports a later, separate Cycle 2 invocation. The signed envelope,
+        its exact CAS event, the hash-chained Cycle 1 claim, current GO/revocation,
+        and the original completed GitHub artifact metadata must all still verify.
+        It performs no CAS writes and does not pretend an expired artifact remains
+        valid.
+        """
+        if getattr(verify_github_artifact, "_allow_in_progress", False) is True:
+            raise CycleControlHold("cycle1_rehydrate_requires_completed_artifact_reader")
+        state, _stored = self._load_for_go(candidate, go)
+        instant = _now(now)
+        revocation = _verify_revocation_status(
+            _current_revocation(state.events), go=go, go_sha256=state.go_sha256,
+            trusted_keys=self._owner_keys, now=instant,
+        )
+        if (revocation["status"] != "ACTIVE" or not go.not_before <= instant < go.expires_at):
+            raise CycleControlHold("cycle1_rehydrate_go_inactive")
+
+        claims, audits = _cycle_history(state.events)
+        if (not claims or claims[0].get("cycle_number") != 1
+                or len(claims) not in (1, 2)
+                or [item.get("cycle_number") for item in claims] != list(range(1, len(claims) + 1))
+                or len(audits) != 1):
+            raise CycleControlHold("cycle1_rehydrate_journal_state_invalid")
+
+        claim_event = next((event for event in state.events
+                            if event["payload"].get("event") == "CYCLE_CLAIMED"
+                            and event["payload"].get("cycle_number") == 1), None)
+        audit_event = next((event for event in state.events
+                            if event["payload"].get("event") == "CYCLE1_AUDITOR_PASS"), None)
+        if claim_event is None or audit_event is None:
+            raise CycleControlHold("cycle1_rehydrate_events_missing")
+        recorded = audit_event["payload"]
+        envelope = recorded.get("auditor_envelope")
+        verified = _verify_auditor_artifact(
+            envelope, go=go, go_sha256=state.go_sha256,
+            trusted_key=self._auditor_key,
+            verify_github_artifact=verify_github_artifact, now=instant, cycle=1,
+        )
+        payload = verified.payload
+        claim_payload = claim_event["payload"]
+        if (verified.envelope_sha256 != recorded.get("artifact_envelope_sha256")
+                or verified.artifact_id != recorded.get("artifact_id")
+                or verified.artifact_archive_digest != recorded.get("artifact_archive_digest")
+                or payload.get("workflow_run_id") != recorded.get("workflow_run_id")
+                or payload.get("run_attempt") != recorded.get("run_attempt")
+                or payload.get("worker_run_id") != recorded.get("worker_run_id")
+                or payload.get("auditor_run_id") != recorded.get("auditor_run_id")
+                or payload.get("source_commit_sha") != recorded.get("source_commit_sha")
+                or payload.get("worker_run_id") != claim_payload.get("run_id")
+                or payload.get("source_commit_sha") != claim_payload.get("source_commit_sha")
+                or claim_payload.get("go_sha256") != state.go_sha256):
+            raise CycleControlHold("cycle1_rehydrate_record_binding_mismatch")
+
+        if (not is_verified_worker_claim(claim) or claim.cycle != 1
+                or claim.run_id != claim_payload["run_id"]
+                or claim.source_commit_sha != claim_payload["source_commit_sha"]
+                or claim.go_sha256 != state.go_sha256
+                or claim.journal_sequence != claim_event["sequence"]
+                or claim.journal_head_sha256 != claim_event["event_sha256"]):
+            raise CycleControlHold("cycle1_rehydrate_claim_receipt_mismatch")
+        return VerifiedStageAudit(
+            claim=claim, envelope_sha256=verified.envelope_sha256,
+            previous_sha256=None, workflow_run_id=payload["workflow_run_id"],
+            run_attempt=payload["run_attempt"], observed_after=_parse_utc(payload["issued_at"]),
+            expires_at=_parse_utc(payload["expires_at"]),
+            auditor_public_key=self._auditor_key.public_key,
+            permit_id=payload["permit_id"], ci_run_id=payload["readonly_ci_run_id"],
+            _seal=_EVIDENCE_SEAL,
+        )
 
     def read(self) -> CycleControlState | None:
         try:

@@ -564,6 +564,20 @@ def _write_f4_audit_evidence(path: str | Path, evidence: Mapping[str, object]) -
         os.fsync(stream.fileno())
 
 
+def _cycle_audit_evidence(evidence: Mapping[str, object], *, cycle: int,
+                          repository_id: int, base_sha: str) -> dict[str, object]:
+    """Preserve the distinct, existing publication evidence schemas per cycle."""
+    if type(cycle) is not int or cycle not in (1, 2):
+        raise PublisherGateHold("f4_audit_cycle_invalid")
+    result = dict(evidence)
+    if cycle == 1:
+        result.pop("permit_sha256", None)
+    elif (not isinstance(result.get("permit_sha256"), str)
+          or not re.fullmatch(r"[0-9a-f]{64}", result["permit_sha256"])):
+        raise PublisherGateHold("cycle2_permit_digest_missing")
+    return {**result, "schema": 1, "repository_id": repository_id, "base_sha": base_sha}
+
+
 def main(argv: list[str] | None = None) -> int:
     """Verify a bundle and prepare a local PR plan; never calls GitHub."""
     parser = argparse.ArgumentParser(description="Verify a DRAFT_HOLD Publisher artifact")
@@ -624,7 +638,8 @@ def main(argv: list[str] | None = None) -> int:
             raise PublisherGateHold("draft_pr_expected_head_invalid")
         if not args.draft_pr_write and args.expected_head_sha:
             raise PublisherGateHold("expected_head_without_write_request")
-        if args.f4_audit_evidence_output and not (args.role == "auditor" and args.audit_pr_ci):
+        if args.f4_audit_evidence_output and not (
+                args.role == "auditor" and args.audit_pr_ci and args.f4_cycle in (1, 2)):
             raise PublisherGateHold("f4_audit_evidence_requires_auditor_ci_pass")
         token_name = (
             "B09_CAS_V2_PUBLISHER_BEARER"
@@ -706,11 +721,13 @@ def main(argv: list[str] | None = None) -> int:
                 evidence = _read_publication(result, github_api, args.expected_pr_head_sha)
                 if evidence["readonly_ci_run_id"] != str(ci_result.run_id):
                     raise WriterHold("f4_audit_ci_changed_during_readback")
-                del evidence["permit_sha256"]  # Keep the existing Cycle1 schema.
-                _write_f4_audit_evidence(args.f4_audit_evidence_output, {
-                    **evidence, "schema": 1, "repository_id": result.repository_id,
-                    "base_sha": result.base_sha,
-                })
+                _write_f4_audit_evidence(
+                    args.f4_audit_evidence_output,
+                    _cycle_audit_evidence(
+                        evidence, cycle=args.f4_cycle,
+                        repository_id=result.repository_id, base_sha=result.base_sha,
+                    ),
+                )
     except WriterHold as exc:
         print(f"HOLD:{exc.reason}", file=sys.stderr)
         return 2

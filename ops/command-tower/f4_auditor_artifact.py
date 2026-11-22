@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
 
 from f4_cycle_control import (
     AUDIT_WORKFLOW_PATH, CycleControlHold, _validate_audit_payload,
@@ -44,6 +45,21 @@ def _read_json(path: str | Path) -> object:
         return json.loads(target.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError("input_json_invalid") from None
+
+
+def _worker_logical_run_id(manifest, numeric_run_id, cycle):
+    """Bind a GitHub Actions run selector to its manifest's logical identity."""
+    if (not isinstance(manifest, dict) or not isinstance(numeric_run_id, str)
+            or not re.fullmatch(r"[1-9][0-9]*", numeric_run_id)):
+        raise ValueError("worker_run_manifest_scope_invalid")
+    logical = manifest.get("worker_run_id")
+    if not isinstance(logical, str):
+        raise ValueError("worker_run_manifest_scope_invalid")
+    match = re.fullmatch(r"([1-9][0-9]*)-([1-9][0-9]*)-cycle-([12])", logical)
+    if (match is None or match.group(1) != numeric_run_id
+            or match.group(3) != str(cycle)):
+        raise ValueError("worker_run_manifest_scope_invalid")
+    return logical
 
 
 def build_payload(*, evidence: object, candidate: object, workspace: str | Path,
@@ -225,24 +241,106 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("evidence", "candidate", "workspace", "expected-base-sha", "trusted-keys", "auditor-key", "revocation", "output"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--cycle", type=int, choices=(1, 2), default=1)
     parser.add_argument("--workflow-run-id", required=True)
     parser.add_argument("--run-attempt", required=True, type=int)
     parser.add_argument("--source-commit-sha", required=True)
+    parser.add_argument("--worker-run-id")
+    parser.add_argument("--worker-manifest")
+    parser.add_argument("--claim-receipt")
+    parser.add_argument("--cycle1-auditor-artifact")
+    parser.add_argument("--cycle1-worker-run-id")
+    parser.add_argument("--cycle1-worker-manifest")
+    parser.add_argument("--cycle1-claim-receipt")
     args = parser.parse_args()
     try:
-        go_sha = create_artifact(
-            evidence=_read_json(args.evidence), candidate=_read_json(args.candidate),
-            workspace=args.workspace, expected_base_sha=args.expected_base_sha,
-            trusted_keys=_read_json(args.trusted_keys),
-            auditor_key_document=_read_json(args.auditor_key),
-            revocation_envelope=_read_json(args.revocation),
-            workflow_run_id=args.workflow_run_id, run_attempt=args.run_attempt,
-            source_commit_sha=args.source_commit_sha, output=args.output,
-        )
-    except (OSError, ValueError, TypeError) as exc:
+        evidence = _read_json(args.evidence)
+        candidate = _read_json(args.candidate)
+        trusted_keys = _read_json(args.trusted_keys)
+        auditor_key_document = _read_json(args.auditor_key)
+        revocation_envelope = _read_json(args.revocation)
+        if args.cycle == 1:
+            go_sha = create_artifact(
+                evidence=evidence, candidate=candidate, workspace=args.workspace,
+                expected_base_sha=args.expected_base_sha, trusted_keys=trusted_keys,
+                auditor_key_document=auditor_key_document,
+                revocation_envelope=revocation_envelope,
+                workflow_run_id=args.workflow_run_id, run_attempt=args.run_attempt,
+                source_commit_sha=args.source_commit_sha, output=args.output,
+            )
+        else:
+            required = (
+                args.worker_run_id, args.worker_manifest, args.claim_receipt,
+                args.cycle1_auditor_artifact, args.cycle1_worker_run_id,
+                args.cycle1_worker_manifest, args.cycle1_claim_receipt,
+            )
+            if any(not value for value in required):
+                raise ValueError("cycle2_worker_or_cycle1_handoff_missing")
+            if (os.environ.get("GITHUB_RUN_ID") != args.workflow_run_id
+                    or os.environ.get("GITHUB_RUN_ATTEMPT") != str(args.run_attempt)
+                    or os.environ.get("GITHUB_SHA") != args.source_commit_sha):
+                raise ValueError("cycle2_auditor_execution_identity_mismatch")
+            from cas_journal import HttpsCasBackend
+            from f4_cycle_control import F4CycleControlJournal, GitHubArtifactProvenanceReader
+            from f4_cycle_runtime import CAS_ENDPOINT, _load_auditor_key
+            from f4_go_gate import verify_f4_go_candidate
+            owner_keys = load_trusted_verification_keys(trusted_keys)
+            auditor_key = _load_auditor_key(auditor_key_document, owner_keys)
+            status_payload = revocation_envelope.get("payload") if isinstance(revocation_envelope, dict) else None
+            if not isinstance(status_payload, dict):
+                raise ValueError("signed_revocation_status_missing")
+            simple_status = {key: status_payload.get(key) for key in ("approval_id", "sequence", "status")}
+            go = verify_f4_go_candidate(
+                candidate=candidate, workspace=args.workspace,
+                expected_repository_id=1458303357,
+                expected_base_sha=args.expected_base_sha,
+                trusted_keys=owner_keys, revocation_status=simple_status,
+                verify_revocation_status=lambda value: value == simple_status,
+            )
+            control_token = os.environ.get("B09_F4_CONTROL_V2_AUDITOR_BEARER", "")
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+            if not control_token or not github_token:
+                raise ValueError("cycle2_read_credentials_missing")
+            journal = F4CycleControlJournal(
+                HttpsCasBackend(endpoint=CAS_ENDPOINT, bearer_token=control_token),
+                trusted_signing_keys=owner_keys, trusted_auditor_key=auditor_key,
+            )
+            provenance_reader = GitHubArtifactProvenanceReader(bearer_token=github_token)
+            cycle1_manifest = _read_json(args.cycle1_worker_manifest)
+            cycle2_manifest = _read_json(args.worker_manifest)
+            cycle1_logical_run_id = _worker_logical_run_id(
+                cycle1_manifest, args.cycle1_worker_run_id, 1,
+            )
+            cycle2_logical_run_id = _worker_logical_run_id(
+                cycle2_manifest, args.worker_run_id, 2,
+            )
+            go_sha = create_cycle2_artifact_from_verified_inputs(
+                journal=journal, provenance_reader=provenance_reader,
+                candidate=candidate, go=go,
+                cycle1_auditor_envelope=_read_json(args.cycle1_auditor_artifact),
+                cycle1_worker_receipt=_read_json(args.cycle1_claim_receipt),
+                cycle1_worker_manifest=cycle1_manifest,
+                cycle1_worker_run_id=cycle1_logical_run_id,
+                cycle1_execution_sha=args.source_commit_sha,
+                cycle2_worker_receipt=_read_json(args.claim_receipt),
+                cycle2_worker_manifest=cycle2_manifest,
+                cycle2_worker_run_id=cycle2_logical_run_id,
+                cycle2_execution_sha=args.source_commit_sha,
+                github_read_token=github_token, publication_evidence=evidence,
+                output=args.output, workspace=args.workspace,
+                expected_base_sha=args.expected_base_sha,
+                trusted_keys=trusted_keys,
+                auditor_key_document=auditor_key_document,
+                revocation_envelope=revocation_envelope,
+                workflow_run_id=args.workflow_run_id, run_attempt=args.run_attempt,
+            )
+    except (OSError, ValueError, TypeError, CycleControlHold, F4GoHold) as exc:
         print("HOLD:" + str(exc))
         return 78
-    print("F4_AUDITOR_ARTIFACT_READY:" + go_sha)
+    except Exception:
+        print("HOLD:auditor_artifact_operation_failed_no_retry")
+        return 78
+    print(f"F4_CYCLE{args.cycle}_AUDITOR_ARTIFACT_READY:" + go_sha)
     return 0
 
 
@@ -281,6 +379,82 @@ def create_cycle2_artifact(*, claim, previous, publication_reader, output,
     signer = _SignerProxy(key, owner_keys)
     _write_envelope(output, sign_cycle2_audit(payload=payload, key_id=key.key_id, private_key=signer))
     return go_sha
+
+
+def create_cycle2_artifact_from_verified_inputs(
+        *, journal, provenance_reader, candidate, go,
+        cycle1_auditor_envelope, cycle1_worker_receipt, cycle1_worker_manifest,
+        cycle1_worker_run_id, cycle1_execution_sha,
+        cycle2_worker_receipt, cycle2_worker_manifest,
+        cycle2_worker_run_id, cycle2_execution_sha, github_read_token,
+        publication_evidence, output, workspace, expected_base_sha, trusted_keys,
+        auditor_key_document, revocation_envelope, workflow_run_id, run_attempt,
+        github_opener=None, now=None):
+    """Connect persisted C1 CAS/audit evidence and the current C2 audit inputs.
+
+    Both Worker claims are read-only verified from their own completed run
+    provenance. The C1 audit must match the signed envelope persisted in CAS;
+    the publication evidence must be the exact structured result produced by
+    the protected PublisherGate readback in this same trusted Auditor job.
+    """
+    from attestations import canonical_json
+    from f4_cycle_control import _sha256
+
+    opener_kwargs = {} if github_opener is None else {"github_opener": github_opener}
+    try:
+        prior_claim = journal.verify_historical_cycle1_claim(
+            candidate=candidate, go=go, receipt=cycle1_worker_receipt,
+            manifest=cycle1_worker_manifest, expected_run_id=cycle1_worker_run_id,
+            expected_execution_sha=cycle1_execution_sha,
+            github_read_token=github_read_token, now=now, **opener_kwargs,
+        )
+        previous = journal.rehydrate_cycle1_stage_audit(
+            candidate=candidate, go=go, verify_github_artifact=provenance_reader,
+            claim=prior_claim, now=now,
+        )
+        if (not isinstance(cycle1_auditor_envelope, dict)
+                or _sha256(canonical_json(cycle1_auditor_envelope)) != previous.envelope_sha256):
+            raise ValueError("cycle1_auditor_handoff_mismatch")
+        claim = journal.verify_worker_claim(
+            candidate=candidate, go=go, receipt=cycle2_worker_receipt,
+            manifest=cycle2_worker_manifest, expected_cycle=2,
+            expected_run_id=cycle2_worker_run_id,
+            expected_execution_sha=cycle2_execution_sha,
+            github_read_token=github_read_token, now=now, **opener_kwargs,
+        )
+        required_publication = {
+            "schema", "repository_id", "base_sha", "worker_run_id", "pr_number",
+            "pr_head_sha", "pr_base_sha", "pr_state", "pr_is_draft", "pr_merged",
+            "readonly_ci_run_id", "readonly_ci_conclusion", "candidate_digest",
+            "permit_id", "permit_sha256", "witness_digest", "journal_revision",
+            "journal_head_sha256",
+        }
+        if (not isinstance(publication_evidence, dict)
+                or set(publication_evidence) != required_publication
+                or publication_evidence.get("schema") != 1
+                or publication_evidence.get("repository_id") != 1458303357
+                or publication_evidence.get("base_sha") != expected_base_sha
+                or publication_evidence.get("worker_run_id") != claim.run_id):
+            raise ValueError("cycle2_publication_evidence_scope_invalid")
+
+        def publication_reader(verified_claim, _signed_payload):
+            if verified_claim != claim:
+                raise ValueError("cycle2_publication_claim_mismatch")
+            return {**{key: value for key, value in publication_evidence.items()
+                       if key not in {"schema", "repository_id", "base_sha"}},
+                    "go_sha256": verified_claim.go_sha256}
+
+        return create_cycle2_artifact(
+            claim=claim, previous=previous, publication_reader=publication_reader,
+            output=output, candidate=candidate, workspace=workspace,
+            expected_base_sha=expected_base_sha, trusted_keys=trusted_keys,
+            auditor_key_document=auditor_key_document,
+            revocation_envelope=revocation_envelope,
+            workflow_run_id=workflow_run_id, run_attempt=run_attempt,
+            source_commit_sha=cycle2_execution_sha, now=now,
+        )
+    except (CycleControlHold, F4GoHold, ValueError, TypeError, OSError):
+        raise ValueError("cycle2_verified_input_binding_failed") from None
 
 
 def verify_cycle2_archive(*, journal, reader, archive, run_id, attempt,

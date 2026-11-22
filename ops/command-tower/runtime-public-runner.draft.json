@@ -1,0 +1,308 @@
+{
+  "schema": 1,
+  "candidate_id": "b09-public-runner-runtime-v2",
+  "state": "DRAFT_HOLD",
+  "signed": false,
+  "signature": null,
+  "policy_candidate_id": "b09-public-runner-policy-v2",
+  "enabled": false,
+  "repository_id": 1458303357,
+  "repository": "not60/sake-autonomy-public-sandbox-20261115",
+  "base_ref": "refs/heads/main",
+  "reused_local_runtime": [
+    {
+      "path": "ops/command-tower/isolated_runtime.py",
+      "sha256": "137a548b641e0c2f102cab6580f3d10e212e3465fcdb7fb31dadccee93a99acc"
+    },
+    {
+      "path": "ops/command-tower/durable_store.py",
+      "sha256": "6bcdda43761650be0100b144da6d0e6bc2690d4aba581cfde50bb2696f4577b6"
+    },
+    {
+      "path": "ops/command-tower/test_process_crash_recovery.py",
+      "sha256": "611a37b4d990d9a9d3a6cb75bbc04388e19e42bd021fb01d25c41758c1d4e816"
+    }
+  ],
+  "local_followup": {
+    "state": "DRAFT_HOLD",
+    "permit_id_uniqueness": {
+      "implementation": "SQLite issued_permit_ids and consumed_permit_ids tables",
+      "restart_persistence": "LOCAL_SINGLE_DATABASE_TESTED",
+      "cross_vm_guarantee": "NOT_CLAIMED"
+    },
+    "publisher_offline_gate": {
+      "path": "ops/command-tower/publisher_gate.py",
+      "signature_scheme": "Ed25519",
+      "signature_backend": "cryptography==50.0.2; fail closed if unavailable",
+      "trusted_keys_configured": false,
+      "test_only_signature_normal_path": "ops/command-tower/test_publisher_gate_crypto.py",
+      "normal_path_test_execution": "HOLD_PYPI_DNS_UNAVAILABLE",
+      "offline_only": true,
+      "github_write": false,
+      "successful_verification_authorizes_publication": false,
+      "manifest_schema": 2,
+      "checks": [
+        "actual_delta",
+        "codex_output_bytes",
+        "base_sha",
+        "file_sha256",
+        "scope",
+        "permit_signature",
+        "witness_signature",
+        "owner_a_and_b_DRAFT_PR_signatures",
+        "CAS_and_SQLite_single_use"
+      ],
+      "draft_pr": "plan_only_no_GitHub_write",
+      "draft_pr_writer": "ops/command-tower/draft_pr_writer.py; local DI only"
+    },
+    "python_dependency": {
+      "requirements_file": "ops/command-tower/requirements-publisher.txt",
+      "cryptography_version": "50.0.2",
+      "isolated_virtualenv_install": "FAILED_PYPI_HOST_DNS_RESOLUTION",
+      "system_python_modified": false,
+      "local_offline_cryptography_available": false,
+      "crypto_test_execution": "HOLD_MODULE_NOT_INSTALLED_NO_NETWORK_RETRY"
+    },
+    "runner_integration": {
+      "independent_job_workflow": ".github/workflows/public-runner-draft.yml",
+      "trigger": "workflow_dispatch_only",
+      "jobs": [
+        "worker",
+        "publisher",
+        "auditor"
+      ],
+      "all_jobs_hard_disabled": true,
+      "actions_commit_pins": true,
+      "artifact_builder": "ops/command-tower/runner_artifact.py",
+      "worker_publisher_auditor_byte_and_signature_gate": "IMPLEMENTED_LOCAL_DRAFT_NOT_EXECUTED",
+      "cross_job_and_cross_run_sqlite_journal": "HOLD",
+      "owner_public_keys": "NOT_CONFIGURED",
+      "worker_publisher_auditor_os_uid_separation": "NOT_CLAIMED",
+      "publisher_codex_allow_users": "REMOVED_FROM_GO_CANDIDATE",
+      "publisher_cas_credential": "DEDICATED_WRITE_TOKEN_NOT_CONFIGURED",
+      "auditor_cas_credential": "DISTINCT_READ_ONLY_TOKEN_NOT_CONFIGURED",
+      "github_writes": false,
+      "publisher_candidate_permissions": {
+        "standard_github_token": {
+          "contents": "read",
+          "pull_requests": "write",
+          "actions": "none"
+        },
+        "separate_repo_limited_credential": {
+          "contents": "write",
+          "pull_requests": "write",
+          "actions": "none"
+        },
+        "credential_status": "NOT_CONFIGURED_NOT_CREATED"
+      }
+    },
+    "local_change_sha256": [
+      {
+        "path": ".github/workflows/public-runner-draft.yml",
+        "sha256": "c71152287c23254f90bea46c5b576578c66fc499c21201bcc89384d2d41c867c"
+      },
+      {
+        "path": "ops/command-tower/attestations.py",
+        "sha256": "e40bc2bca0e83aca50a23dff1ddab5eec73ac73725c98570c1492cfa7641ec0a"
+      },
+      {
+        "path": "ops/command-tower/backlog-public-runner.draft.json",
+        "sha256": "0c605e6e406ae8ecdd6b9ed1a219185905702ab6685da57bdfb76b736954c7ad"
+      },
+      {
+        "path": "ops/command-tower/cas_journal.py",
+        "sha256": "61374cef5aee0b896f6b0216dcb3b1189c79a4fc0ce74c90caea07d4086156c2"
+      },
+      {
+        "path": "ops/command-tower/draft_pr_writer.py",
+        "sha256": "7d31ca381a83c54e6e2ef898e67f39ac74921355f0eb896086d3f8c148f559ac"
+      },
+      {
+        "path": "ops/command-tower/policy-public-runner.draft.json",
+        "sha256": "16ee9f2fba05d2fd2484b7f6f8c0d83fa3be71a12213fd9a566e0a8ba69d022a"
+      },
+      {
+        "path": "ops/command-tower/publisher_gate.py",
+        "sha256": "5bb88f70a523976148f724d24b976a5175e20151e488820ae559b21cfec1055e"
+      },
+      {
+        "path": "ops/command-tower/runner_artifact.py",
+        "sha256": "22bb3e57695f01723580cb4269123b0ce3be77900b96af12101bbc75a0bf609b"
+      },
+      {
+        "path": "ops/command-tower/test_cas_journal.py",
+        "sha256": "9214762fe6bfb09dc6654b9b7a0a43800588ae252032a7ffa09227c7ab3b22dc"
+      },
+      {
+        "path": "ops/command-tower/test_draft_pr_writer.py",
+        "sha256": "16617954cb147aa4e3a6f84eb5f072b8673e4435ef4fbc0cda2ee7baff44d90f"
+      },
+      {
+        "path": "ops/command-tower/test_public_runner_draft_contract.py",
+        "sha256": "a781ce40c7a03cedd90b532db5e8a7e2947120cc046d3b688dc831aae90fb6f4"
+      },
+      {
+        "path": "ops/command-tower/test_public_runner_workflow_draft.py",
+        "sha256": "d7d842621a76dd5d8f7a95d1972c3ac3ceac899a5670d9c2de611570adb3167d"
+      },
+      {
+        "path": "ops/command-tower/test_publisher_branch_commit.py",
+        "sha256": "5cea89d121a898066e3ba8f3dacb7ae53e416f1ddc3d73b4affbe380a4594f49"
+      },
+      {
+        "path": "ops/command-tower/test_publisher_gate.py",
+        "sha256": "228daf905a5a256150bd9eb4af21a654d302fb506a9a982b86aeb229530e78fd"
+      },
+      {
+        "path": "ops/command-tower/test_publisher_gate_crypto.py",
+        "sha256": "64876fd488235e7c20f3b31c0f70c04a9e08349cf6992929de0aa7e0be27bd0d"
+      },
+      {
+        "path": "ops/command-tower/test_runner_artifact.py",
+        "sha256": "f0a044ad4b9bffba48f53083935f4a23d63d711b06bff71317f4a42da859a03e"
+      }
+    ],
+    "worker_delta_binding": {
+      "changed_paths": "git diff and untracked-file discovery against exact base SHA",
+      "rejects": [
+        "base_HEAD_mismatch",
+        "deletions_renames_type_changes",
+        "unmerged_paths",
+        "path_outside_allowlist",
+        "symlink",
+        "empty_delta"
+      ],
+      "manifest_binds": [
+        "repository_id",
+        "base_sha",
+        "worker_run_id",
+        "codex_output_sha256",
+        "changed_paths",
+        "file_sha256s"
+      ],
+      "fixed_allowlist_is_not_treated_as_worker_output": true
+    },
+    "attestations": {
+      "module": "ops/command-tower/attestations.py",
+      "permit_authority_and_witness": "separate_Ed25519_signing_functions_and_role_keys",
+      "owner_a_owner_b": "separate_DRAFT_PR_ONLY_signed_scope_required_by_publisher",
+      "test_keys": "ephemeral_test_only",
+      "owner_keys_configured": false,
+      "formal_go": false
+    },
+    "external_cas": {
+      "module": "ops/command-tower/cas_journal.py",
+      "protocol": "HTTPS_ETag_conditional_PUT_with_If_Match_or_If_None_Match",
+      "records": [
+        "PERMIT_ISSUED",
+        "PERMIT_CONSUMED",
+        "witness_digest",
+        "worker_run_id",
+        "journal_hash_chain"
+      ],
+      "cross_job_replay_protection": "implemented_contract_not_live_verified",
+      "endpoint_configured": false,
+      "publisher_write_credential_configured": false,
+      "auditor_read_credential_configured": false,
+      "legacy_supabase_write": false,
+      "server_atomic_if_match_and_durable_persistence": "UNVERIFIED; MOCK_TESTS_ONLY",
+      "mock_pass_is_live_environment_pass": false
+    },
+    "publisher_writer": {
+      "path": "ops/command-tower/draft_pr_writer.py",
+      "state": "LOCAL_INJECTED_CANDIDATE_ONLY",
+      "github_client": "NOT_IMPLEMENTED_OR_CONNECTED",
+      "operation_order": [
+        "Gate_Permit_CAS_approval",
+        "artifact_SHA256_check",
+        "nonforce_branch_commit",
+        "post_commit_readback",
+        "Draft_PR_request"
+      ],
+      "target_repository_id": 1458303357,
+      "base_branch": "main",
+      "head_branch": "review/b09-public-runner-draft-20261116",
+      "allowed_changed_paths": "existing_publisher_writer_allowlist_only",
+      "standard_github_token_permissions": {
+        "contents": "read",
+        "pull_requests": "write",
+        "actions": "none"
+      },
+      "separate_publisher_credential_candidate": {
+        "type": "repo_limited_GitHub_App_or_fine_grained_PAT",
+        "permissions": {
+          "contents": "write",
+          "pull_requests": "write",
+          "actions": "none"
+        },
+        "status": "NOT_CONFIGURED_NOT_CREATED"
+      },
+      "force": false,
+      "ambiguous_commit_result": "HOLD_NO_RETRY",
+      "dependency_injection_tests": "9_PASS_NO_NETWORK",
+      "github_write_executed": false,
+      "branch_commit_api_contract": "GraphQL createCommitOnBranch mutation; expectedHeadOid is passed in input; no force field",
+      "concurrent_head_conflict": "HOLD; one mutation attempt; no retry; no Draft PR",
+      "graphql_api_error": "HOLD; one mutation attempt; no retry; no Draft PR",
+      "retry_protection": "one mutation attempt per repo/branch/expectedHead/candidate in process; cross-process idempotency requires unverified external CAS"
+    }
+  },
+  "job_boundary": {
+    "worker_job": "worker",
+    "publisher_job": "publisher",
+    "auditor_job": "auditor",
+    "each_job_uses_fresh_standard_github_hosted_vm": true,
+    "numeric_uid_uniqueness_across_vms": "NOT_A_SECURITY_CLAIM",
+    "same_job_filesystem_or_sqlite_connection_shared": false,
+    "worker_credential": "Codex-only API credential plus GitHub contents read",
+    "publisher_credential": "CAS write token; separate future repo-limited GitHub credential",
+    "auditor_credential": "distinct CAS read-only token; no Worker/Publisher token",
+    "cross_vm_identity": "GitHub-hosted VM separation is a candidate only; not executed"
+  },
+  "permit": {
+    "single_use": true,
+    "binds": [
+      "policy_sha256",
+      "runtime_sha256",
+      "backlog_sha256",
+      "repository_id",
+      "base_sha",
+      "candidate_sha256",
+      "changed_paths",
+      "worker_run_id"
+    ],
+    "consumption_transaction": "existing SQLite DurableStore transaction",
+    "cross_job_state": "external_CAS_conditional_append_contract_live_credentials_HOLD"
+  },
+  "witness": {
+    "binds_permit_digest_and_candidate_sha256": true,
+    "must_be_independent_of_worker_and_publisher": true,
+    "signature_verification": "HOLD_NO_SIGNING_OR_VERIFICATION_KEY_CONFIGURED",
+    "journal_parent_binding": "CAS_head_sha256_after_permit_issuance"
+  },
+  "journal": {
+    "implementation": "existing SQLite DurableStore hash chain",
+    "per_job_database": "ephemeral_runner_local_file",
+    "snapshot_transfer": "untrusted_artifact_rehashed_by_publisher_and_auditor",
+    "tamper_resistance_against_same_job_identity": "NOT_CLAIMED",
+    "cross_run_retention_and_replay_protection": "HOLD_UNRESOLVED",
+    "external_boundary": "ETag_compare_and_swap_HTTP_backend_implemented",
+    "live_endpoint_and_credentials": "HOLD_NOT_CONFIGURED",
+    "auditor_verification": "read_only_consumed_event_and_chain_check"
+  },
+  "safe_stop": {
+    "on_missing_or_invalid_policy": true,
+    "on_base_sha_change": true,
+    "on_artifact_hash_or_path_mismatch": true,
+    "on_missing_or_invalid_permit_or_witness": true,
+    "on_journal_or_sqlite_recovery_failure": true,
+    "on_unexpected_credential_or_permission": true,
+    "on_cross_job_snapshot_or_parent_mismatch": true
+  },
+  "external_effects": {
+    "github_write": false,
+    "pull_request_creation": false,
+    "actions_dispatch": false,
+    "formal_worker_start": false
+  }
+}

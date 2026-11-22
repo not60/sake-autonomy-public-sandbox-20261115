@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "candidate_id": "b09-public-runner-backlog-v2",
+  "state": "DRAFT_HOLD",
+  "signed": false,
+  "signature": null,
+  "policy_candidate_id": "b09-public-runner-policy-v2",
+  "runtime_candidate_id": "b09-public-runner-runtime-v2",
+  "repository_id": 1458303357,
+  "repository": "not60/sake-autonomy-public-sandbox-20261115",
+  "tasks": [
+    {
+      "id": "runner-policy-review",
+      "state": "HOLD",
+      "scope": "Compare exact signed Policy/Runtime/Backlog sources and Owner A/B signatures against the public runner candidates.",
+      "requires": [
+        "source_sha256s",
+        "signature_verification",
+        "owner_a_approval",
+        "owner_b_approval"
+      ]
+    },
+    {
+      "id": "worker-credential-boundary",
+      "state": "HOLD",
+      "scope": "Confirm an already-existing Worker-only Codex credential; do not create or expose a secret.",
+      "requires": [
+        "worker_only_secret_presence_confirmation",
+        "immutable_codex_action_commit_pin"
+      ]
+    },
+    {
+      "id": "publisher-and-pr-ci-boundary",
+      "state": "HOLD",
+      "scope": "Select a single-repository GitHub App token or fine-grained PAT for Publisher and confirm Actions can create PRs.",
+      "requires": [
+        "publisher_only_credential",
+        "repo_scope_readback",
+        "workflow_permissions_readback"
+      ]
+    },
+    {
+      "id": "permit-witness-journal-transport",
+      "state": "HOLD",
+      "scope": "Define cryptographic Permit/Witness verification and cross-job, cross-run SQLite journal snapshot retention and replay recovery.",
+      "requires": [
+        "signed_attestation_contract",
+        "durable_snapshot_parent_chain",
+        "recovery_tests"
+      ]
+    },
+    {
+      "id": "local-runner-contract-tests",
+      "state": "READY_FOR_LOCAL_ONLY_TESTS",
+      "scope": "Validate candidate Policy/Runtime/Backlog consistency without network, credentials, or Worker execution.",
+      "requires": []
+    },
+    {
+      "id": "draft-pr-and-ci-cycle-1",
+      "state": "NOT_AUTHORIZED",
+      "scope": "Create a genuine Draft PR and read back the existing pull_request CI result after all signed GO gates pass.",
+      "requires": [
+        "owner_a_and_b_formal_go",
+        "publisher_credential",
+        "explicit_pr_and_actions_authorization"
+      ]
+    },
+    {
+      "id": "worker-cycle-2",
+      "state": "NOT_AUTHORIZED",
+      "scope": "Run a second sequential Worker cycle only after cycle 1 independent audit and safe stop readback.",
+      "requires": [
+        "cycle_1_audit_pass",
+        "permit_and_journal_continuity",
+        "explicit_worker_authorization"
+      ]
+    },
+    {
+      "id": "worker-delta-and-codex-output-binding",
+      "state": "LOCAL_IMPLEMENTED_NEEDS_OWNER_REVIEW",
+      "scope": "Discover only actual changed files against exact base SHA; bind Codex output and file bytes into schema 2 manifest.",
+      "requires": [
+        "changed_path_allowlist_approval",
+        "exact_workflow_sha_approval"
+      ]
+    },
+    {
+      "id": "permit-witness-ed25519-and-cas",
+      "state": "LOCAL_IMPLEMENTED_CRYPTO_TEST_HOLD",
+      "scope": "Separate Permit Authority and Witness Ed25519 routes; use ETag CAS journal across jobs and runs.",
+      "requires": [
+        "isolated_crypto_dependency",
+        "owner_public_key_registry",
+        "external_cas_endpoint",
+        "separate_cas_credentials"
+      ]
+    },
+    {
+      "id": "publisher-auditor-draft-pr-gates",
+      "state": "LOCAL_IMPLEMENTED_NO_GITHUB_WRITE",
+      "scope": "Publisher prepares Draft PR metadata only after signed bundle, dual Owner signatures, and CAS/SQLite consumption; Auditor verifies the consumed CAS event read-only.",
+      "requires": [
+        "owner_a_and_b_draft_pr_signatures",
+        "publisher_repo_limited_credential",
+        "auditor_cas_read_credential",
+        "separate_pr_ci_authorization"
+      ]
+    }
+  ],
+  "status": {
+    "stage2": "NO_GO",
+    "worker_success_count": "0/2"
+  }
+}

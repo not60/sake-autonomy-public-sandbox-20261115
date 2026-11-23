@@ -1,4 +1,4 @@
-"""Narrow negative tests plus an opt-in Linux/Docker process probe."""
+"""Probe boundary tests and separately gated formal F4 contract tests."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -13,8 +13,14 @@ COMMAND_TOWER = ROOT / "ops" / "command-tower"
 sys.path.insert(0, str(COMMAND_TOWER))
 sys.path.insert(0, str(ROOT / "tools"))
 
-import f4_cycle_control
-from f4_cycle_control import VerifiedStageAudit
+F4_CYCLE_CONTROL_AVAILABLE = (COMMAND_TOWER / "f4_cycle_control.py").is_file()
+if F4_CYCLE_CONTROL_AVAILABLE:
+    import f4_cycle_control
+    from f4_cycle_control import VerifiedStageAudit
+else:
+    f4_cycle_control = None
+    VerifiedStageAudit = None
+
 from f4_linux_supervisor_probe import (
     LinuxDockerSupervisor,
     ProcessObservation,
@@ -77,6 +83,9 @@ class SupervisorBoundaryNegativeTests(unittest.TestCase):
             with self.subTest(changed=changed[0]):
                 with self.assertRaises(SupervisorHold):
                     validate_container_inspect(changed, expected_image=IMAGE)
+
+class FormalF4SafeStopContractTests(unittest.TestCase):
+    """These tests run only when the real F4 contract source is present."""
 
     def test_unsealed_or_pre_audit_observation_never_signs(self):
         supervisor = LinuxDockerSupervisor.__new__(LinuxDockerSupervisor)
@@ -155,6 +164,12 @@ class SupervisorBoundaryNegativeTests(unittest.TestCase):
                                     "continuation_namespace": "other-cgroup"},
                 )
         observe.assert_not_called()
+
+
+FormalF4SafeStopContractTests = unittest.skipUnless(
+    F4_CYCLE_CONTROL_AVAILABLE,
+    "requires the F4 cycle-control source, which is outside the probe-only tree",
+)(FormalF4SafeStopContractTests)
 
 
 @unittest.skipUnless(os.environ.get("F4_RUN_DOCKER_PROBE") == "1", "requires the approved GitHub-hosted Linux runner")

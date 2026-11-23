@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -83,6 +84,35 @@ class SupervisorBoundaryNegativeTests(unittest.TestCase):
             with self.subTest(changed=changed[0]):
                 with self.assertRaises(SupervisorHold):
                     validate_container_inspect(changed, expected_image=IMAGE)
+
+    def test_wait_probe_reconciles_only_confirmed_terminal_snapshot_race(self):
+        for final_running in (False, True):
+            with self.subTest(final_running=final_running):
+                supervisor = LinuxDockerSupervisor.__new__(LinuxDockerSupervisor)
+                supervisor.container_id = CONTAINER_ID
+                supervisor.cgroup_path = "/sys/fs/cgroup/f4-probe"
+                observed = ProcessObservation(CONTAINER_ID, IMAGE, supervisor.cgroup_path,
+                                              datetime.now(timezone.utc), True, (4321,))
+                states = iter((
+                    '[{"State":{"Running":true,"ExitCode":0}}]',
+                    '[{"State":{"Running":'
+                    + ("true" if final_running else "false")
+                    + ',"ExitCode":0}}]',
+                ))
+                supervisor._run = lambda _argv, **_kwargs: SimpleNamespace(stdout=next(states))
+                with patch.object(
+                    supervisor,
+                    "observe_processes",
+                    side_effect=[observed, SupervisorHold("docker_top_and_cgroup_observation_disagree")],
+                ), patch("f4_linux_supervisor_probe._cgroup_process_ids", return_value=()) as cgroup_pids:
+                    if final_running:
+                        with self.assertRaisesRegex(SupervisorHold, "docker_top_and_cgroup_observation_disagree"):
+                            supervisor.wait_probe(timeout_seconds=1)
+                        cgroup_pids.assert_not_called()
+                    else:
+                        supervisor.wait_probe(timeout_seconds=1)
+                        cgroup_pids.assert_called_once_with(supervisor.cgroup_path)
+
 
 class FormalF4SafeStopContractTests(unittest.TestCase):
     """These tests run only when the real F4 contract source is present."""

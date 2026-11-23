@@ -212,7 +212,29 @@ class LinuxDockerSupervisor:
         deadline = time.monotonic() + timeout_seconds
         saw_host_process = False
         while time.monotonic() < deadline:
-            observation = self.observe_processes()
+            try:
+                observation = self.observe_processes()
+            except SupervisorHold as exc:
+                # docker top and cgroup.procs are separate snapshots. If the
+                # observed process exits between them, accept only an
+                # independently confirmed successful container exit with an
+                # empty cgroup; all live, ambiguous, or residual states HOLD.
+                if str(exc) != "docker_top_and_cgroup_observation_disagree" or not saw_host_process:
+                    raise
+                if not self.cgroup_path:
+                    raise SupervisorHold("container_cgroup_unavailable_after_observation_race") from None
+                inspect = self._run(["docker", "inspect", self.container_id], timeout=10)
+                try:
+                    state = json.loads(inspect.stdout)[0]["State"]
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                    raise SupervisorHold("container_state_unreadable_after_observation_race") from None
+                if state.get("Running") is not False:
+                    raise
+                if state.get("ExitCode") != 0:
+                    raise SupervisorHold("probe_exit_or_process_observation_invalid")
+                if _cgroup_process_ids(self.cgroup_path):
+                    raise SupervisorHold("residual_processes_observed")
+                return
             saw_host_process = saw_host_process or bool(observation.process_ids)
             inspect = self._run(["docker", "inspect", self.container_id], timeout=10)
             try:
